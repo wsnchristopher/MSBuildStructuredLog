@@ -54,7 +54,7 @@ namespace StructuredLogViewer.Avalonia.Controls
         private TabItem filesTab;
         private TabItem propertiesAndItemsTab;
         private TabItem findInFilesTab;
-        private TreeView filesTree;
+        private SearchAndResultsControl filesTree;
         private TabControl centralTabControl;
         private ListBox breadCrumb;
         private TabControl leftPaneTabControl;
@@ -255,8 +255,9 @@ namespace StructuredLogViewer.Avalonia.Controls
                 filesTab.IsVisible = true;
                 findInFilesTab.IsVisible = true;
                 PopulateFilesTab();
-                filesTree.Styles.Add(GetTreeViewItemStyle());
-                RegisterTreeViewHandlers(filesTree);
+                filesTree.ResultsList.Styles.Add(GetTreeViewItemStyle());
+                RegisterTreeViewHandlers(filesTree.ResultsList);
+                filesTree.TextChanged += FilesTree_SearchTextChanged;
 
                 var text =
 @"This log contains the full text of projects and imported files used during the build.
@@ -607,9 +608,73 @@ Recent:
                 CompressTree(subFolder);
             }
 
-            filesTree.ItemsSource = root.Children;
-            filesTree.GotFocus += (s, a) => ActiveTreeView = filesTree;
-            filesTree.ContextMenu = sharedTreeContextMenu;
+            filesTree.DisplayItems(root.Children);
+            filesTree.ResultsList.GotFocus += (s, a) => ActiveTreeView = filesTree.ResultsList;
+            filesTree.ResultsList.ContextMenu = sharedTreeContextMenu;
+        }
+
+        private void FilesTree_SearchTextChanged(string text)
+        {
+            var list = filesTree.ResultsList.ItemsSource as IEnumerable<object>;
+            if (list != null)
+            {
+                UpdateFileVisibility(list.OfType<NamedNode>(), text);
+            }
+        }
+
+        private bool UpdateFileVisibility(IEnumerable<NamedNode> items, string text)
+        {
+            bool visible = false;
+
+            if (items == null)
+            {
+                return false;
+            }
+
+            foreach (var item in items)
+            {
+                if (item is Folder folder)
+                {
+                    var subItems = folder.Children.OfType<NamedNode>();
+                    var folderVisibility = UpdateFileVisibility(subItems, text);
+                    folder.IsVisible = folderVisibility;
+                    visible |= folderVisibility;
+                }
+                else if (item is SourceFile file)
+                {
+                    if (string.IsNullOrEmpty(text) || file.SourceFilePath.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1)
+                    {
+                        visible = true;
+                        file.IsVisible = true;
+                    }
+                    else
+                    {
+                        file.IsVisible = false;
+                    }
+
+                    var subItems = file.Children.OfType<NamedNode>();
+                    var fileVisibility = UpdateFileVisibility(subItems, text);
+                    file.IsVisible |= fileVisibility;
+                    visible |= fileVisibility;
+                }
+                else if (item is Target || item is Task)
+                {
+                    if (string.IsNullOrEmpty(text) ||
+                        item.Name.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1 ||
+                        (text == "$target" && item is Target) ||
+                        (text == "$task" && item is Task))
+                    {
+                        visible = true;
+                        item.IsVisible = true;
+                    }
+                    else
+                    {
+                        item.IsVisible = false;
+                    }
+                }
+            }
+
+            return visible;
         }
 
         private void CompressTree(Folder parent)

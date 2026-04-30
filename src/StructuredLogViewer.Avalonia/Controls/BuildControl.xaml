@@ -35,7 +35,7 @@
             </TabItem>
 
             <TabItem Name="filesTab" Header="Files" IsVisible="false">
-              <TreeView Name="filesTree"></TreeView>
+              <local:SearchAndResultsControl Name="filesTree"></local:SearchAndResultsControl>
             </TabItem>
 
             <TabItem Name="findInFilesTab" Header="Find in Files" IsVisible="False">
