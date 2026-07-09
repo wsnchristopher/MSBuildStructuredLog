@@ -303,6 +303,19 @@
                            Opacity="{Binding IsLowRelevance, Converter={StaticResource RelevanceConverter}}" />
             </StackPanel>
         </DataTemplate>
+
+        <DataTemplate DataType="{x:Type l:MSBuildServerNode}">
+            <StackPanel Orientation="Horizontal">
+                <Rectangle Name="icon"
+                           Classes="nodeIcon"
+                           Stroke="{StaticResource MSBuildServerStroke}"
+                           Fill="{StaticResource MSBuildServerBrush}" />
+                <TextBlock Name="messageText"
+                           Classes="nodeText"
+                           Text="{Binding ShortenedText}"
+                           Opacity="{Binding IsLowRelevance, Converter={StaticResource RelevanceConverter}}" />
+            </StackPanel>
+        </DataTemplate>
         
         <TreeDataTemplate DataType="{x:Type l:Import}"
                           ItemsSource="{Binding Children}">

@@ -342,6 +342,8 @@ namespace Microsoft.Build.Logging.StructuredLogger
                 BinaryLogRecordKind.BuildCheckAcquisition => ReadBuildCheckAcquisitionEventArgs(),
                 BinaryLogRecordKind.BuildSubmissionStarted => ReadBuildSubmissionStartedEventArgs(),
                 BinaryLogRecordKind.BuildCanceled => ReadBuildCanceledEventArgs(),
+                BinaryLogRecordKind.LoggersRegistered => ReadLoggersRegisteredEventArgs(),
+                BinaryLogRecordKind.MSBuildServerLifecycle => ReadMSBuildServerLifecycleEventArgs(),
                 _ => null,
                 
             };
@@ -1345,6 +1347,66 @@ namespace Microsoft.Build.Logging.StructuredLogger
                 assemblyPath,
                 mvid,
                 appDomainName);
+            SetCommonFields(e, fields);
+            e.ProjectFile = fields.ProjectFile;
+
+            return e;
+        }
+
+        private BuildEventArgs ReadMSBuildServerLifecycleEventArgs()
+        {
+            var fields = ReadBuildEventArgsFields(readImportance: true);
+
+            MSBuildServerLifecycleKind kind = (MSBuildServerLifecycleKind)ReadInt32();
+            int processId = ReadInt32();
+            string reason = ReadDeduplicatedString();
+            string reasonCode = ReadDeduplicatedString();
+            bool shortLived = ReadBoolean();
+
+            var e = new MSBuildServerLifecycleEventArgs(
+                kind,
+                processId,
+                reason,
+                reasonCode,
+                fields.Message,
+                fields.Importance,
+                shortLived);
+            SetCommonFields(e, fields);
+            e.ProjectFile = fields.ProjectFile;
+
+            return e;
+        }
+
+        private BuildEventArgs ReadLoggersRegisteredEventArgs()
+        {
+            // Registered-loggers event (binary-log format v26+). This fork does not have a strongly-typed node
+            // for it; read (and discard) the logger list — including each logger's output file paths — so the
+            // record is fully consumed, and surface the "Enabled loggers: ..." text as an ordinary message
+            // instead of skipping it.
+            var fields = ReadBuildEventArgsFields();
+
+            int count = ReadInt32();
+            for (int i = 0; i < count; i++)
+            {
+                ReadDeduplicatedString(); // LoggerName
+                ReadDeduplicatedString(); // Parameters
+                if (ReadBoolean())        // has verbosity
+                {
+                    ReadInt32();          // Verbosity
+                }
+
+                int pathCount = ReadInt32();
+                for (int j = 0; j < pathCount; j++)
+                {
+                    ReadDeduplicatedString(); // output file path
+                }
+            }
+
+            var e = new BuildMessageEventArgs(
+                fields.Message,
+                fields.HelpKeyword,
+                fields.SenderName,
+                fields.Importance);
             SetCommonFields(e, fields);
             e.ProjectFile = fields.ProjectFile;
 
