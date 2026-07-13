@@ -217,11 +217,11 @@ namespace StructuredLogViewer.Avalonia.Controls
             {
                 var treeViewItemStyle = new Style(s => s.OfType<TreeViewItem>());
                 treeViewItemStyle.Setters.Add(new Setter(TreeViewItem.IsExpandedProperty,
-                    CompiledBinding.Create<Item, bool>(i => i.IsExpanded, mode: BindingMode.TwoWay)));
+                    CompiledBinding.Create<IExpandable, bool>(i => i.IsExpanded, mode: BindingMode.TwoWay)));
                 treeViewItemStyle.Setters.Add(new Setter(TreeViewItem.IsSelectedProperty,
                     CompiledBinding.Create<Item, bool>(i => i.IsSelected, mode: BindingMode.TwoWay)));
                 treeViewItemStyle.Setters.Add(new Setter(IsVisibleProperty,
-                    CompiledBinding.Create<Item, bool>(i => i.IsVisible, mode: BindingMode.TwoWay)));
+                    CompiledBinding.Create<IExpandable, bool>(i => i.IsVisible, mode: BindingMode.TwoWay)));
                 return treeViewItemStyle;
             }
 

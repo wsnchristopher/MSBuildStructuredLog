@@ -7,7 +7,7 @@ using System.Threading.Tasks;
 
 namespace Microsoft.Build.Logging.StructuredLogger
 {
-    public abstract class TreeNode : BaseNode
+    public abstract class TreeNode : BaseNode, IExpandable
     {
         public bool IsVisible
         {
