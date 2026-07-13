@@ -49,6 +49,25 @@ namespace StructuredLogViewer.Avalonia.Controls
         static SplitterPanel()
         {
             AffectsMeasure<SplitterPanel>(OrientationProperty);
+
+            // Avalonia sets StyledProperties from XAML via SetValue, bypassing the CLR
+            // setters, so the Orientation setter's UpdateRowColumnInfo() call never fires.
+            // Worse, the relative-size properties are applied without re-running the grid
+            // layout, so UpdateRowColumnInfo() can cache the default 1* sizes and never pick
+            // up values like SecondChildRelativeSize="50". Rebuild the grid whenever any of
+            // these change so the behavior matches WPF.
+            OrientationProperty.Changed.AddClassHandler<SplitterPanel>((x, _) => x.UpdateRowColumnInfo());
+            FirstChildRelativeSizeProperty.Changed.AddClassHandler<SplitterPanel>((x, _) => x.OnRelativeSizeChanged());
+            SecondChildRelativeSizeProperty.Changed.AddClassHandler<SplitterPanel>((x, _) => x.OnRelativeSizeChanged());
+        }
+
+        private void OnRelativeSizeChanged()
+        {
+            // Refresh the cached sizes from the current property values and rebuild, so a
+            // late-applied XAML value (e.g. "50") is honored instead of a stale default.
+            oldFirstSize = FirstChildRelativeSize;
+            oldSecondSize = SecondChildRelativeSize;
+            UpdateRowColumnInfo();
         }
 
         private Control firstChild;
