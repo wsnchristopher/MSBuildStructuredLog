@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections;
 using System.Collections.Generic;
 using System.IO;
@@ -57,210 +57,6 @@ namespace StructuredLogViewer.Avalonia.Controls
             }
         }
 
-        /// <summary>
-        /// Returns the workspace directory for VS Code.
-        /// Uses the binlog file's directory, or null if the path doesn't exist locally.
-        /// </summary>
-        public string GetWorkspacePath()
-        {
-            if (Build == null) return null;
-
-            var binlogDir = Path.GetDirectoryName(Build.LogFilePath);
-            if (!string.IsNullOrEmpty(binlogDir) && Directory.Exists(binlogDir))
-            {
-                return FindRepoRoot(binlogDir) ?? binlogDir;
-            }
-
-            return null;
-        }
-
-        /// <summary>
-        /// Walks up from a directory to find a repository root (contains .git or .sln).
-        /// </summary>
-        private static string FindRepoRoot(string startDir)
-        {
-            var dir = startDir;
-            while (!string.IsNullOrEmpty(dir))
-            {
-                if (Directory.Exists(Path.Combine(dir, ".git")))
-                    return dir;
-                if (Directory.GetFiles(dir, "*.sln", SearchOption.TopDirectoryOnly).Length > 0)
-                    return dir;
-                var parent = Path.GetDirectoryName(dir);
-                if (parent == dir) break;
-                dir = parent;
-            }
-            return null;
-        }
-
-        /// <summary>
-        /// Launches VS Code with the workspace folder and binlog URI handler.
-        /// Auto-installs the binlog-analyzer extension if not already installed.
-        /// </summary>
-        public void OpenInVSCode(VSCodeInstallation installation = null)
-        {
-            var binlogPath = Build?.LogFilePath;
-            if (string.IsNullOrEmpty(binlogPath))
-            {
-                return;
-            }
-
-            if (installation == null)
-            {
-                var installations = FindVSCodeInstallations();
-                installation = installations.FirstOrDefault();
-            }
-
-            if (installation == null)
-            {
-                return;
-            }
-
-            try
-            {
-                TPLTask.Run(() => EnsureExtensionInstalled(installation));
-
-                var folder = GetWorkspacePath();
-
-                // Build the URI using the correct scheme for this variant
-                var uri = $"{installation.UriScheme}://dotutils.binlog-analyzer/open?path=" + Uri.EscapeDataString(binlogPath);
-                foreach (var attached in attachedBinlogs)
-                {
-                    uri += "&path=" + Uri.EscapeDataString(attached);
-                }
-
-                // Launch VS Code with folder, then send URI after a short delay.
-                // Combining --new-window + --open-url in one call can cause VS Code to ignore the folder.
-                var codeExe = installation.ExePath;
-                var folderArg = !string.IsNullOrEmpty(folder) ? $"\"{folder}\"" : "";
-                Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--new-window {folderArg}".Trim(), UseShellExecute = true });
-
-                var capturedUri = uri;
-                TPLTask.Run(async () =>
-                {
-                    try
-                    {
-                        await TPLTask.Delay(1000);
-                        Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--open-url \"{capturedUri}\"", UseShellExecute = true });
-                    }
-                    catch { }
-                });
-            }
-            catch
-            {
-            }
-        }
-
-        private static readonly string ExtensionId = "dotutils.binlog-analyzer";
-
-        private static void EnsureExtensionInstalled(VSCodeInstallation installation)
-        {
-            try
-            {
-                var codeDir = Path.GetDirectoryName(installation.ExePath);
-                var codeCli = Path.Combine(codeDir, "bin", installation.CliName + ".cmd");
-                if (!File.Exists(codeCli))
-                {
-                    codeCli = Path.Combine(codeDir, "bin", installation.CliName);
-                }
-
-                // Check if extension is already installed
-                var checkPsi = new ProcessStartInfo
-                {
-                    FileName = "cmd.exe",
-                    Arguments = $"/c \"{codeCli}\" --list-extensions",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardOutput = true,
-                };
-
-                using var checkProc = Process.Start(checkPsi);
-                var output = checkProc?.StandardOutput.ReadToEnd() ?? "";
-                checkProc?.WaitForExit(10000);
-
-                if (output.IndexOf(ExtensionId, StringComparison.OrdinalIgnoreCase) >= 0)
-                {
-                    return;
-                }
-
-                // Install from VS Code Marketplace
-                var installPsi = new ProcessStartInfo
-                {
-                    FileName = "cmd.exe",
-                    Arguments = $"/c \"{codeCli}\" --install-extension {ExtensionId} --force",
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                };
-
-                using var installProc = Process.Start(installPsi);
-                installProc?.WaitForExit(60000);
-            }
-            catch
-            {
-                // Non-fatal — user can install manually
-            }
-        }
-
-        public static List<VSCodeInstallation> FindVSCodeInstallations()
-        {
-            var installations = new List<VSCodeInstallation>();
-
-            var variants = new[]
-            {
-                new { Name = "VS Code", FolderName = "Microsoft VS Code", ExeName = "Code.exe", UriScheme = "vscode", CliName = "code" },
-                new { Name = "VS Code Insiders", FolderName = "Microsoft VS Code Insiders", ExeName = "Code - Insiders.exe", UriScheme = "vscode-insiders", CliName = "code-insiders" },
-            };
-
-            foreach (var variant in variants)
-            {
-                string[] candidates =
-                {
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", variant.FolderName, variant.ExeName),
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), variant.FolderName, variant.ExeName),
-                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), variant.FolderName, variant.ExeName),
-                };
-
-                foreach (var candidate in candidates)
-                {
-                    if (File.Exists(candidate))
-                    {
-                        installations.Add(new VSCodeInstallation(variant.Name, candidate, variant.UriScheme, variant.CliName));
-                        break;
-                    }
-                }
-            }
-
-            // Fallback: resolve from code.cmd / code-insiders.cmd in PATH
-            try
-            {
-                var pathDirs = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? Array.Empty<string>();
-                foreach (var variant in variants)
-                {
-                    if (installations.Any(i => i.CliName == variant.CliName))
-                        continue;
-
-                    var cmdName = variant.CliName + ".cmd";
-                    foreach (var dir in pathDirs)
-                    {
-                        var codeCmdPath = Path.Combine(dir, cmdName);
-                        if (File.Exists(codeCmdPath))
-                        {
-                            // code.cmd is in <install>/bin/, Code.exe is in <install>/
-                            var codeExe = Path.Combine(Path.GetDirectoryName(dir) ?? dir, variant.ExeName);
-                            if (File.Exists(codeExe))
-                            {
-                                installations.Add(new VSCodeInstallation(variant.Name, codeExe, variant.UriScheme, variant.CliName));
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            return installations;
-        }
-
         private ScrollViewer scrollViewer = null;
 
         private SourceFileResolver sourceFileResolver;
@@ -271,31 +67,31 @@ namespace StructuredLogViewer.Avalonia.Controls
         private MenuItem copyItem;
         private MenuItem copySubtreeItem;
         private MenuItem copyVisibleSubtreeItem;
+        private MenuItem viewSubtreeTextItem;
+        private MenuItem searchInSubtreeItem;
+        private MenuItem searchInNodeByNameItem;
+        private MenuItem searchThisNode;
+        private MenuItem viewPropertyItem;
+        private MenuItem excludeSubtreeFromSearchItem;
+        private MenuItem excludeNodeByNameFromSearch;
+        private MenuItem searchInclusiveWithinThisTimespan;
+        private MenuItem searchExclusiveWithinThisTimespan;
+        private MenuItem copyChildrenItem;
         private MenuItem sortChildrenByNameItem;
         private MenuItem sortChildrenByDurationItem;
         private MenuItem copyNameItem;
         private MenuItem copyValueItem;
         private MenuItem viewSourceItem;
-        private MenuItem showFileInExplorerItem;
-        private MenuItem preprocessItem;
-        private MenuItem hideItem;
-        private MenuItem copyChildrenItem;
-        private MenuItem viewSubtreeTextItem;
-        private MenuItem showTimeItem;
         private MenuItem openFileItem;
         private MenuItem copyFilePathItem;
-        private MenuItem viewPropertyItem;
-        private MenuItem searchInSubtreeItem;
-        private MenuItem searchInNodeByNameItem;
-        private MenuItem searchThisNode;
-        private MenuItem excludeSubtreeFromSearchItem;
-        private MenuItem excludeNodeByNameFromSearch;
-        private MenuItem searchInclusiveWithinThisTimespan;
-        private MenuItem searchExclusiveWithinThisTimespan;
+        private MenuItem showFileInExplorerItem;
+        private MenuItem preprocessItem;
+        private MenuItem showTimeItem;
         private MenuItem favoriteItem;
         private MenuItem unfavoriteItem;
         private MenuItem favoriteSharedItem;
         private MenuItem unfavoriteSharedItem;
+        private MenuItem hideItem;
         private ContextMenu sharedTreeContextMenu;
         private ContextMenu filesTreeContextMenu;
         private TreeView treeView;
@@ -599,6 +395,210 @@ Right-clicking a project node may show the 'Preprocess' option if the version of
             centralTabControl.SelectionChanged += CentralTabControl_SelectionChanged;
         }
 
+        /// <summary>
+        /// Returns the workspace directory for VS Code.
+        /// Uses the binlog file's directory, or null if the path doesn't exist locally.
+        /// </summary>
+        public string GetWorkspacePath()
+        {
+            if (Build == null) return null;
+
+            var binlogDir = Path.GetDirectoryName(Build.LogFilePath);
+            if (!string.IsNullOrEmpty(binlogDir) && Directory.Exists(binlogDir))
+            {
+                return FindRepoRoot(binlogDir) ?? binlogDir;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Walks up from a directory to find a repository root (contains .git or .sln).
+        /// </summary>
+        private static string FindRepoRoot(string startDir)
+        {
+            var dir = startDir;
+            while (!string.IsNullOrEmpty(dir))
+            {
+                if (Directory.Exists(Path.Combine(dir, ".git")))
+                    return dir;
+                if (Directory.GetFiles(dir, "*.sln", SearchOption.TopDirectoryOnly).Length > 0)
+                    return dir;
+                var parent = Path.GetDirectoryName(dir);
+                if (parent == dir) break;
+                dir = parent;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Launches VS Code with the workspace folder and binlog URI handler.
+        /// Auto-installs the binlog-analyzer extension if not already installed.
+        /// </summary>
+        public void OpenInVSCode(VSCodeInstallation installation = null)
+        {
+            var binlogPath = Build?.LogFilePath;
+            if (string.IsNullOrEmpty(binlogPath))
+            {
+                return;
+            }
+
+            if (installation == null)
+            {
+                var installations = FindVSCodeInstallations();
+                installation = installations.FirstOrDefault();
+            }
+
+            if (installation == null)
+            {
+                return;
+            }
+
+            try
+            {
+                TPLTask.Run(() => EnsureExtensionInstalled(installation));
+
+                var folder = GetWorkspacePath();
+
+                // Build the URI using the correct scheme for this variant
+                var uri = $"{installation.UriScheme}://dotutils.binlog-analyzer/open?path=" + Uri.EscapeDataString(binlogPath);
+                foreach (var attached in attachedBinlogs)
+                {
+                    uri += "&path=" + Uri.EscapeDataString(attached);
+                }
+
+                // Launch VS Code with folder, then send URI after a short delay.
+                // Combining --new-window + --open-url in one call can cause VS Code to ignore the folder.
+                var codeExe = installation.ExePath;
+                var folderArg = !string.IsNullOrEmpty(folder) ? $"\"{folder}\"" : "";
+                Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--new-window {folderArg}".Trim(), UseShellExecute = true });
+
+                var capturedUri = uri;
+                TPLTask.Run(async () =>
+                {
+                    try
+                    {
+                        await TPLTask.Delay(1000);
+                        Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--open-url \"{capturedUri}\"", UseShellExecute = true });
+                    }
+                    catch { }
+                });
+            }
+            catch
+            {
+            }
+        }
+
+        private static readonly string ExtensionId = "dotutils.binlog-analyzer";
+
+        private static void EnsureExtensionInstalled(VSCodeInstallation installation)
+        {
+            try
+            {
+                var codeDir = Path.GetDirectoryName(installation.ExePath);
+                var codeCli = Path.Combine(codeDir, "bin", installation.CliName + ".cmd");
+                if (!File.Exists(codeCli))
+                {
+                    codeCli = Path.Combine(codeDir, "bin", installation.CliName);
+                }
+
+                // Check if extension is already installed
+                var checkPsi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"{codeCli}\" --list-extensions",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                };
+
+                using var checkProc = Process.Start(checkPsi);
+                var output = checkProc?.StandardOutput.ReadToEnd() ?? "";
+                checkProc?.WaitForExit(10000);
+
+                if (output.IndexOf(ExtensionId, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return;
+                }
+
+                // Install from VS Code Marketplace
+                var installPsi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"{codeCli}\" --install-extension {ExtensionId} --force",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+
+                using var installProc = Process.Start(installPsi);
+                installProc?.WaitForExit(60000);
+            }
+            catch
+            {
+                // Non-fatal — user can install manually
+            }
+        }
+
+        public static List<VSCodeInstallation> FindVSCodeInstallations()
+        {
+            var installations = new List<VSCodeInstallation>();
+
+            var variants = new[]
+            {
+                new { Name = "VS Code", FolderName = "Microsoft VS Code", ExeName = "Code.exe", UriScheme = "vscode", CliName = "code" },
+                new { Name = "VS Code Insiders", FolderName = "Microsoft VS Code Insiders", ExeName = "Code - Insiders.exe", UriScheme = "vscode-insiders", CliName = "code-insiders" },
+            };
+
+            foreach (var variant in variants)
+            {
+                string[] candidates =
+                {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", variant.FolderName, variant.ExeName),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), variant.FolderName, variant.ExeName),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), variant.FolderName, variant.ExeName),
+                };
+
+                foreach (var candidate in candidates)
+                {
+                    if (File.Exists(candidate))
+                    {
+                        installations.Add(new VSCodeInstallation(variant.Name, candidate, variant.UriScheme, variant.CliName));
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: resolve from code.cmd / code-insiders.cmd in PATH
+            try
+            {
+                var pathDirs = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? Array.Empty<string>();
+                foreach (var variant in variants)
+                {
+                    if (installations.Any(i => i.CliName == variant.CliName))
+                        continue;
+
+                    var cmdName = variant.CliName + ".cmd";
+                    foreach (var dir in pathDirs)
+                    {
+                        var codeCmdPath = Path.Combine(dir, cmdName);
+                        if (File.Exists(codeCmdPath))
+                        {
+                            // code.cmd is in <install>/bin/, Code.exe is in <install>/
+                            var codeExe = Path.Combine(Path.GetDirectoryName(dir) ?? dir, variant.ExeName);
+                            if (File.Exists(codeExe))
+                            {
+                                installations.Add(new VSCodeInstallation(variant.Name, codeExe, variant.UriScheme, variant.CliName));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return installations;
+        }
+
         private void CentralTabControl_SelectionChanged(object sender, SelectionChangedEventArgs e)
         {
             var selectedItem = centralTabControl.SelectedItem as TabItem;
@@ -664,6 +664,70 @@ Right-clicking a project node may show the 'Preprocess' option if the version of
             documentWell = tabs.SecondChild as DocumentWell;
             searchLogControl = searchLogTab.Content as SearchAndResultsControl;
             findInFilesControl = findInFilesTab.Content as SearchAndResultsControl;
+        }
+
+        private void FilesTree_SearchTextChanged(string text)
+        {
+            var list = filesTree.ResultsList.ItemsSource as IEnumerable<object>;
+            if (list != null)
+            {
+                UpdateFileVisibility(list.OfType<NamedNode>(), text);
+            }
+        }
+
+        private bool UpdateFileVisibility(IEnumerable<NamedNode> items, string text)
+        {
+            bool visible = false;
+
+            if (items == null)
+            {
+                return false;
+            }
+
+            foreach (var item in items)
+            {
+                if (item is Folder folder)
+                {
+                    var subItems = folder.Children.OfType<NamedNode>();
+                    var folderVisibility = UpdateFileVisibility(subItems, text);
+                    folder.IsVisible = folderVisibility;
+                    visible |= folderVisibility;
+                }
+                else if (item is SourceFile file)
+                {
+                    if (string.IsNullOrEmpty(text) || file.SourceFilePath.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1)
+                    {
+                        visible = true;
+                        file.IsVisible = true;
+                    }
+                    else
+                    {
+                        file.IsVisible = false;
+                    }
+
+                    var subItems = file.Children.OfType<NamedNode>();
+                    var fileVisibility = UpdateFileVisibility(subItems, text);
+                    file.IsVisible |= fileVisibility;
+                    visible |= fileVisibility;
+                }
+                else if (item is Target || item is Task)
+                {
+                    if (string.IsNullOrEmpty(text) ||
+                        item.Name.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1 ||
+                        (text == "$target" && item is Target) ||
+                        (text == "$task" && item is Task))
+                    {
+                        visible = true;
+                        item.IsVisible = true;
+                    }
+                    else
+                    {
+                        item.IsVisible = false;
+                    }
+                }
+            }
+
+            return visible;
         }
 
         public void SelectTree()
@@ -890,6 +954,19 @@ Recent:
             }
         }
 
+        private void SharedTreeContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            var node = ActiveTreeView.SelectedItem as BaseNode;
+            if (node == null)
+            {
+                return;
+            }
+
+            bool isFavorite = IsFavorite(node);
+            favoriteSharedItem.IsVisible = !isFavorite;
+            unfavoriteSharedItem.IsVisible = isFavorite;
+        }
+
         private object FindInFiles(string searchText, int maxResults, CancellationToken cancellationToken)
         {
             var results = new List<(string, IEnumerable<(int, string)>)>();
@@ -991,68 +1068,10 @@ Recent:
             filesTree.ResultsList.ContextMenu = sharedTreeContextMenu;
         }
 
-        private void FilesTree_SearchTextChanged(string text)
+        private SourceFile AddSourceFile(Folder folder, string filePath)
         {
-            var list = filesTree.ResultsList.ItemsSource as IEnumerable<object>;
-            if (list != null)
-            {
-                UpdateFileVisibility(list.OfType<NamedNode>(), text);
-            }
-        }
-
-        private bool UpdateFileVisibility(IEnumerable<NamedNode> items, string text)
-        {
-            bool visible = false;
-
-            if (items == null)
-            {
-                return false;
-            }
-
-            foreach (var item in items)
-            {
-                if (item is Folder folder)
-                {
-                    var subItems = folder.Children.OfType<NamedNode>();
-                    var folderVisibility = UpdateFileVisibility(subItems, text);
-                    folder.IsVisible = folderVisibility;
-                    visible |= folderVisibility;
-                }
-                else if (item is SourceFile file)
-                {
-                    if (string.IsNullOrEmpty(text) || file.SourceFilePath.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1)
-                    {
-                        visible = true;
-                        file.IsVisible = true;
-                    }
-                    else
-                    {
-                        file.IsVisible = false;
-                    }
-
-                    var subItems = file.Children.OfType<NamedNode>();
-                    var fileVisibility = UpdateFileVisibility(subItems, text);
-                    file.IsVisible |= fileVisibility;
-                    visible |= fileVisibility;
-                }
-                else if (item is Target || item is Task)
-                {
-                    if (string.IsNullOrEmpty(text) ||
-                        item.Name.IndexOf(text, StringComparison.OrdinalIgnoreCase) > -1 ||
-                        (text == "$target" && item is Target) ||
-                        (text == "$task" && item is Task))
-                    {
-                        visible = true;
-                        item.IsVisible = true;
-                    }
-                    else
-                    {
-                        item.IsVisible = false;
-                    }
-                }
-            }
-
-            return visible;
+            var parts = filePath.Split('\\', '/');
+            return AddSourceFile(folder, filePath, parts, 0);
         }
 
         private void CompressTree(Folder parent)
@@ -1077,12 +1096,6 @@ Recent:
                     CompressTree(subFolder);
                 }
             }
-        }
-
-        private SourceFile AddSourceFile(Folder folder, string filePath)
-        {
-            var parts = filePath.Split('\\', '/');
-            return AddSourceFile(folder, filePath, parts, 0);
         }
 
         private SourceFile AddSourceFile(Folder folder, string filePath, string[] parts, int index)
@@ -1454,6 +1467,32 @@ Recent:
             leftPaneTabControl.SelectedItem = searchLogTab;
         }
 
+        public void SelectPropertiesAndItemsTab(string newText = null)
+        {
+            if (newText != null)
+            {
+                propertiesAndItemsControl.SearchText = newText;
+            }
+
+            leftPaneTabControl.SelectedItem = propertiesAndItemsTab;
+        }
+
+        public void SelectFindInFilesTab(string newText = null)
+        {
+            if (!findInFilesTab.IsVisible)
+            {
+                return;
+            }
+
+            if (newText != null)
+            {
+                findInFilesControl.SearchText = newText;
+            }
+
+            leftPaneTabControl.SelectedItem = findInFilesTab;
+            findInFilesControl.searchTextBox.Focus();
+        }
+
         public void Delete()
         {
             if (treeView.SelectedItem is TreeNode node)
@@ -1503,16 +1542,6 @@ Recent:
             {
                 var text = timedNode.GetTimeAndDurationText(fullPrecision: true);
                 DisplayText(text, timedNode.ToString());
-            }
-        }
-
-        public void CopyChildren()
-        {
-            if (treeView.SelectedItem is TreeNode node && node.HasChildren)
-            {
-                var children = node.Children.Select(c => c.GetFullText());
-                var text = string.Join(Environment.NewLine, children);
-                CopyToClipboard(text);
             }
         }
 
@@ -1625,17 +1654,149 @@ Recent:
             }
         }
 
-        private void SharedTreeContextMenu_Opened(object sender, RoutedEventArgs e)
+        public void OpenFile()
         {
-            var node = ActiveTreeView.SelectedItem as BaseNode;
-            if (node == null)
+            if (treeView.SelectedItem is Import import)
             {
-                return;
+                DisplayFile(import.ImportedProjectFilePath, evaluation: import.GetNearestParent<ProjectEvaluation>());
+            }
+        }
+
+        public void CopyFilePath()
+        {
+            string toCopy = null;
+            if (treeView.SelectedItem is Import import)
+            {
+                toCopy = import.ImportedProjectFilePath;
+            }
+            else if (treeView.SelectedItem is IHasSourceFile file)
+            {
+                toCopy = file.SourceFilePath;
             }
 
-            bool isFavorite = IsFavorite(node);
-            favoriteSharedItem.IsVisible = !isFavorite;
-            unfavoriteSharedItem.IsVisible = isFavorite;
+            if (toCopy != null)
+            {
+                CopyToClipboard(toCopy);
+            }
+        }
+
+        public void ShowFileInExplorer()
+        {
+            string path = FileExplorerHelper.GetFilePathFromNode(treeView.SelectedItem as BaseNode);
+
+            if (path != null)
+            {
+                FileExplorerHelper.ShowInExplorer(path);
+            }
+        }
+
+        private bool CanShowInExplorer()
+        {
+            return FileExplorerHelper.GetFilePathFromNode(treeView.SelectedItem as BaseNode) is not null;
+        }
+
+        public void ViewProperty()
+        {
+            var selectedItem = treeView.SelectedItem;
+            if (selectedItem is Property property)
+            {
+                SearchForProperty(property.Name);
+            }
+            else if (selectedItem is PropertyAssignmentMessage assignment)
+            {
+                SearchForProperty(assignment.Parent.Title);
+            }
+            else if (selectedItem is Folder reassignmentFolder
+                && reassignmentFolder.Parent is TimedNode parent
+                && (parent.Name == Strings.PropertyReassignmentFolder || parent.Name == Strings.PropertyAssignmentFolder))
+            {
+                SearchForProperty(reassignmentFolder.Name);
+            }
+        }
+
+        public void SearchInSubtree()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                searchLogControl.SearchText += $" under(${treeNode.Index})";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchInNodeByName()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                if (treeNode is Project)
+                {
+                    searchLogControl.SearchText += $" project({treeNode.Name})";
+                }
+                else
+                {
+                    searchLogControl.SearchText += $" under(${treeNode.TypeName} {treeNode.Name})";
+                }
+
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchThisNode()
+        {
+            if (treeView.SelectedItem is SearchableItem searchNode)
+            {
+                searchLogControl.SearchText = searchNode.SearchText;
+                SelectSearchTab();
+            }
+        }
+
+        public void ExcludeSubtreeFromSearch()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                searchLogControl.SearchText += $" notunder(${treeNode.Index})";
+                SelectSearchTab();
+            }
+        }
+
+        public void ExcludeNodeByNameFromSearch()
+        {
+            if (treeView.SelectedItem is NamedNode treeNode)
+            {
+                searchLogControl.SearchText += $" notunder(${treeNode.TypeName} {treeNode.Name})";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchInclusiveWithinThisTimespan()
+        {
+            if (treeView.SelectedItem is TimedNode timedNode)
+            {
+                DateTime starTime = timedNode.StartTime;
+                DateTime endTime = timedNode.EndTime;
+                searchLogControl.SearchText += $" start<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\" end>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" ";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchExclusiveWithinThisTimespan()
+        {
+            if (treeView.SelectedItem is TimedNode timedNode)
+            {
+                DateTime starTime = timedNode.StartTime;
+                DateTime endTime = timedNode.EndTime;
+                searchLogControl.SearchText += $" start>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" end<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\"";
+                SelectSearchTab();
+            }
+        }
+
+        public void CopyChildren()
+        {
+            if (treeView.SelectedItem is TreeNode node && node.HasChildren)
+            {
+                var children = node.Children.Select(c => c.GetFullText());
+                var text = string.Join(Environment.NewLine, children);
+                CopyToClipboard(text);
+            }
         }
 
         public void SortChildrenByName()
@@ -1734,234 +1895,6 @@ Recent:
             }
         }
 
-        public void ShowFileInExplorer()
-        {
-            string path = FileExplorerHelper.GetFilePathFromNode(treeView.SelectedItem as BaseNode);
-
-            if (path != null)
-            {
-                FileExplorerHelper.ShowInExplorer(path);
-            }
-        }
-
-        private bool CanShowInExplorer()
-        {
-            return FileExplorerHelper.GetFilePathFromNode(treeView.SelectedItem as BaseNode) is not null;
-        }
-
-        public void OpenFile()
-        {
-            if (treeView.SelectedItem is Import import)
-            {
-                DisplayFile(import.ImportedProjectFilePath, evaluation: import.GetNearestParent<ProjectEvaluation>());
-            }
-        }
-
-        public void CopyFilePath()
-        {
-            string toCopy = null;
-            if (treeView.SelectedItem is Import import)
-            {
-                toCopy = import.ImportedProjectFilePath;
-            }
-            else if (treeView.SelectedItem is IHasSourceFile file)
-            {
-                toCopy = file.SourceFilePath;
-            }
-
-            if (toCopy != null)
-            {
-                CopyToClipboard(toCopy);
-            }
-        }
-
-        private bool CanOpenFile(BaseNode node)
-        {
-            return node is Import i && sourceFileResolver.HasFile(i.ImportedProjectFilePath);
-        }
-
-        public void ViewProperty()
-        {
-            var selectedItem = treeView.SelectedItem;
-            if (selectedItem is Property property)
-            {
-                SearchForProperty(property.Name);
-            }
-            else if (selectedItem is PropertyAssignmentMessage assignment)
-            {
-                SearchForProperty(assignment.Parent.Title);
-            }
-            else if (selectedItem is Folder reassignmentFolder
-                && reassignmentFolder.Parent is TimedNode parent
-                && (parent.Name == Strings.PropertyReassignmentFolder || parent.Name == Strings.PropertyAssignmentFolder))
-            {
-                SearchForProperty(reassignmentFolder.Name);
-            }
-        }
-
-        public void SearchInSubtree()
-        {
-            if (treeView.SelectedItem is TimedNode treeNode)
-            {
-                searchLogControl.SearchText += $" under(${treeNode.Index})";
-                SelectSearchTab();
-            }
-        }
-
-        public void SearchInNodeByName()
-        {
-            if (treeView.SelectedItem is TimedNode treeNode)
-            {
-                if (treeNode is Project)
-                {
-                    searchLogControl.SearchText += $" project({treeNode.Name})";
-                }
-                else
-                {
-                    searchLogControl.SearchText += $" under(${treeNode.TypeName} {treeNode.Name})";
-                }
-
-                SelectSearchTab();
-            }
-        }
-
-        public void SearchThisNode()
-        {
-            if (treeView.SelectedItem is SearchableItem searchNode)
-            {
-                searchLogControl.SearchText = searchNode.SearchText;
-                SelectSearchTab();
-            }
-        }
-
-        public void ExcludeSubtreeFromSearch()
-        {
-            if (treeView.SelectedItem is TimedNode treeNode)
-            {
-                searchLogControl.SearchText += $" notunder(${treeNode.Index})";
-                SelectSearchTab();
-            }
-        }
-
-        public void ExcludeNodeByNameFromSearch()
-        {
-            if (treeView.SelectedItem is NamedNode treeNode)
-            {
-                searchLogControl.SearchText += $" notunder(${treeNode.TypeName} {treeNode.Name})";
-                SelectSearchTab();
-            }
-        }
-
-        public void SearchInclusiveWithinThisTimespan()
-        {
-            if (treeView.SelectedItem is TimedNode timedNode)
-            {
-                DateTime starTime = timedNode.StartTime;
-                DateTime endTime = timedNode.EndTime;
-                searchLogControl.SearchText += $" start<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\" end>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" ";
-                SelectSearchTab();
-            }
-        }
-
-        public void SearchExclusiveWithinThisTimespan()
-        {
-            if (treeView.SelectedItem is TimedNode timedNode)
-            {
-                DateTime starTime = timedNode.StartTime;
-                DateTime endTime = timedNode.EndTime;
-                searchLogControl.SearchText += $" start>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" end<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\"";
-                SelectSearchTab();
-            }
-        }
-
-        private bool SearchForProject(string name)
-        {
-            var text = $"$projectreference project({name})";
-            searchLogControl.SearchText = text;
-            return true;
-        }
-
-        private bool SearchForTarget(string name)
-        {
-            string text = searchLogControl.SearchText;
-            var matcher = new NodeQueryMatcher(text);
-            string project = "";
-            if (matcher.ProjectMatchers.Count == 1)
-            {
-                project = $" project({matcher.ProjectMatchers[0].Query})";
-            }
-
-            text = $"$target \"{name}\"{project}";
-            searchLogControl.SearchText = text;
-            return true;
-        }
-
-        private bool SearchForProperty(string name)
-        {
-            SelectPropertiesAndItemsTab($"$property \"{name}\"");
-            return true;
-        }
-
-        private bool SearchForFullPath(string filePath)
-        {
-            var text = searchLogControl.SearchText;
-            var matcher = new NodeQueryMatcher(text);
-            if (matcher.Terms.Count == 1 &&
-                matcher.Terms[0].Word is string substring &&
-                filePath.IndexOf(substring, StringComparison.OrdinalIgnoreCase) != -1)
-            {
-                text = text.Replace(substring, filePath);
-                searchLogControl.SearchText = text;
-                return true;
-            }
-            else if (matcher.Terms.Count == 0 && matcher.ProjectMatchers.Count > 0)
-            {
-                text = $"{text} {filePath}";
-                searchLogControl.SearchText = text;
-                return true;
-            }
-
-            return false;
-        }
-
-        private bool DisplayEmbeddedFile(Item item)
-        {
-            string path = item.Text;
-            var candidates = sourceFileResolver.ArchiveFile.FindFileNames(path).ToArray();
-            if (candidates.Length == 1)
-            {
-                return DisplayFile(candidates[0]);
-            }
-
-            return false;
-        }
-
-        public void SelectPropertiesAndItemsTab(string newText = null)
-        {
-            if (newText != null)
-            {
-                propertiesAndItemsControl.SearchText = newText;
-            }
-
-            leftPaneTabControl.SelectedItem = propertiesAndItemsTab;
-        }
-
-        public void SelectFindInFilesTab(string newText = null)
-        {
-            if (!findInFilesTab.IsVisible)
-            {
-                return;
-            }
-
-            if (newText != null)
-            {
-                findInFilesControl.SearchText = newText;
-            }
-
-            leftPaneTabControl.SelectedItem = findInFilesTab;
-            findInFilesControl.searchTextBox.Focus();
-        }
-
         private void MoveSelectionOut(BaseNode node)
         {
             var parent = node.Parent;
@@ -2017,6 +1950,11 @@ Recent:
             return (node is NameValueNode nvn && nvn.IsValueShortened)
                 || (node is NamedNode nn && nn.IsNameShortened)
                 || (node is TextNode tn && tn.IsTextShortened);
+        }
+
+        private bool CanOpenFile(BaseNode node)
+        {
+            return node is Import i && sourceFileResolver.HasFile(i.ImportedProjectFilePath);
         }
 
         private bool Invoke(BaseNode treeNode)
@@ -2110,6 +2048,68 @@ Recent:
             catch
             {
                 // in case our guessing of file path goes awry
+            }
+
+            return false;
+        }
+
+        private bool SearchForFullPath(string filePath)
+        {
+            var text = searchLogControl.SearchText;
+            var matcher = new NodeQueryMatcher(text);
+            if (matcher.Terms.Count == 1 &&
+                matcher.Terms[0].Word is string substring &&
+                filePath.IndexOf(substring, StringComparison.OrdinalIgnoreCase) != -1)
+            {
+                text = text.Replace(substring, filePath);
+                searchLogControl.SearchText = text;
+                return true;
+            }
+            else if (matcher.Terms.Count == 0 && matcher.ProjectMatchers.Count > 0)
+            {
+                text = $"{text} {filePath}";
+                searchLogControl.SearchText = text;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool SearchForProject(string name)
+        {
+            var text = $"$projectreference project({name})";
+            searchLogControl.SearchText = text;
+            return true;
+        }
+
+        private bool SearchForTarget(string name)
+        {
+            string text = searchLogControl.SearchText;
+            var matcher = new NodeQueryMatcher(text);
+            string project = "";
+            if (matcher.ProjectMatchers.Count == 1)
+            {
+                project = $" project({matcher.ProjectMatchers[0].Query})";
+            }
+
+            text = $"$target \"{name}\"{project}";
+            searchLogControl.SearchText = text;
+            return true;
+        }
+
+        private bool SearchForProperty(string name)
+        {
+            SelectPropertiesAndItemsTab($"$property \"{name}\"");
+            return true;
+        }
+
+        private bool DisplayEmbeddedFile(Item item)
+        {
+            string path = item.Text;
+            var candidates = sourceFileResolver.ArchiveFile.FindFileNames(path).ToArray();
+            if (candidates.Length == 1)
+            {
+                return DisplayFile(candidates[0]);
             }
 
             return false;
