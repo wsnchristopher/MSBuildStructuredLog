@@ -6,6 +6,7 @@ using System.Linq;
 using System.Reflection;
 using System.Text;
 using System.Threading;
+using System.Diagnostics;
 using System.Xml;
 using Avalonia;
 using Avalonia.Controls;
@@ -16,16 +17,249 @@ using Avalonia.Interactivity;
 using Avalonia.Markup.Xaml;
 using Avalonia.Styling;
 using Avalonia.Threading;
+using Microsoft.Build.Framework;
 using Microsoft.Build.Logging.StructuredLogger;
 using Microsoft.Language.Xml;
+using TPLTask = System.Threading.Tasks.Task;
 
 namespace StructuredLogViewer.Avalonia.Controls
 {
+    public class VSCodeInstallation
+    {
+        public string Name { get; }
+        public string ExePath { get; }
+        public string UriScheme { get; }
+        public string CliName { get; }
+
+        public VSCodeInstallation(string name, string exePath, string uriScheme, string cliName)
+        {
+            Name = name;
+            ExePath = exePath;
+            UriScheme = uriScheme;
+            CliName = cliName;
+        }
+    }
+
     public partial class BuildControl : UserControl
     {
         public Build Build { get; set; }
         public TreeViewItem SelectedTreeViewItem { get; private set; }
         public string LogFilePath => Build?.LogFilePath;
+
+        private readonly List<string> attachedBinlogs = new List<string>();
+        public int AttachedBinlogCount => attachedBinlogs.Count;
+
+        public void AttachBinlog(string path)
+        {
+            if (!string.IsNullOrEmpty(path) && !attachedBinlogs.Contains(path, StringComparer.OrdinalIgnoreCase))
+            {
+                attachedBinlogs.Add(path);
+            }
+        }
+
+        /// <summary>
+        /// Returns the workspace directory for VS Code.
+        /// Uses the binlog file's directory, or null if the path doesn't exist locally.
+        /// </summary>
+        public string GetWorkspacePath()
+        {
+            if (Build == null) return null;
+
+            var binlogDir = Path.GetDirectoryName(Build.LogFilePath);
+            if (!string.IsNullOrEmpty(binlogDir) && Directory.Exists(binlogDir))
+            {
+                return FindRepoRoot(binlogDir) ?? binlogDir;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Walks up from a directory to find a repository root (contains .git or .sln).
+        /// </summary>
+        private static string FindRepoRoot(string startDir)
+        {
+            var dir = startDir;
+            while (!string.IsNullOrEmpty(dir))
+            {
+                if (Directory.Exists(Path.Combine(dir, ".git")))
+                    return dir;
+                if (Directory.GetFiles(dir, "*.sln", SearchOption.TopDirectoryOnly).Length > 0)
+                    return dir;
+                var parent = Path.GetDirectoryName(dir);
+                if (parent == dir) break;
+                dir = parent;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// Launches VS Code with the workspace folder and binlog URI handler.
+        /// Auto-installs the binlog-analyzer extension if not already installed.
+        /// </summary>
+        public void OpenInVSCode(VSCodeInstallation installation = null)
+        {
+            var binlogPath = Build?.LogFilePath;
+            if (string.IsNullOrEmpty(binlogPath))
+            {
+                return;
+            }
+
+            if (installation == null)
+            {
+                var installations = FindVSCodeInstallations();
+                installation = installations.FirstOrDefault();
+            }
+
+            if (installation == null)
+            {
+                return;
+            }
+
+            try
+            {
+                TPLTask.Run(() => EnsureExtensionInstalled(installation));
+
+                var folder = GetWorkspacePath();
+
+                // Build the URI using the correct scheme for this variant
+                var uri = $"{installation.UriScheme}://dotutils.binlog-analyzer/open?path=" + Uri.EscapeDataString(binlogPath);
+                foreach (var attached in attachedBinlogs)
+                {
+                    uri += "&path=" + Uri.EscapeDataString(attached);
+                }
+
+                // Launch VS Code with folder, then send URI after a short delay.
+                // Combining --new-window + --open-url in one call can cause VS Code to ignore the folder.
+                var codeExe = installation.ExePath;
+                var folderArg = !string.IsNullOrEmpty(folder) ? $"\"{folder}\"" : "";
+                Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--new-window {folderArg}".Trim(), UseShellExecute = true });
+
+                var capturedUri = uri;
+                TPLTask.Run(async () =>
+                {
+                    try
+                    {
+                        await TPLTask.Delay(1000);
+                        Process.Start(new ProcessStartInfo { FileName = codeExe, Arguments = $"--open-url \"{capturedUri}\"", UseShellExecute = true });
+                    }
+                    catch { }
+                });
+            }
+            catch
+            {
+            }
+        }
+
+        private static readonly string ExtensionId = "dotutils.binlog-analyzer";
+
+        private static void EnsureExtensionInstalled(VSCodeInstallation installation)
+        {
+            try
+            {
+                var codeDir = Path.GetDirectoryName(installation.ExePath);
+                var codeCli = Path.Combine(codeDir, "bin", installation.CliName + ".cmd");
+                if (!File.Exists(codeCli))
+                {
+                    codeCli = Path.Combine(codeDir, "bin", installation.CliName);
+                }
+
+                // Check if extension is already installed
+                var checkPsi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"{codeCli}\" --list-extensions",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                    RedirectStandardOutput = true,
+                };
+
+                using var checkProc = Process.Start(checkPsi);
+                var output = checkProc?.StandardOutput.ReadToEnd() ?? "";
+                checkProc?.WaitForExit(10000);
+
+                if (output.IndexOf(ExtensionId, StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    return;
+                }
+
+                // Install from VS Code Marketplace
+                var installPsi = new ProcessStartInfo
+                {
+                    FileName = "cmd.exe",
+                    Arguments = $"/c \"{codeCli}\" --install-extension {ExtensionId} --force",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+
+                using var installProc = Process.Start(installPsi);
+                installProc?.WaitForExit(60000);
+            }
+            catch
+            {
+                // Non-fatal — user can install manually
+            }
+        }
+
+        public static List<VSCodeInstallation> FindVSCodeInstallations()
+        {
+            var installations = new List<VSCodeInstallation>();
+
+            var variants = new[]
+            {
+                new { Name = "VS Code", FolderName = "Microsoft VS Code", ExeName = "Code.exe", UriScheme = "vscode", CliName = "code" },
+                new { Name = "VS Code Insiders", FolderName = "Microsoft VS Code Insiders", ExeName = "Code - Insiders.exe", UriScheme = "vscode-insiders", CliName = "code-insiders" },
+            };
+
+            foreach (var variant in variants)
+            {
+                string[] candidates =
+                {
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "Programs", variant.FolderName, variant.ExeName),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), variant.FolderName, variant.ExeName),
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), variant.FolderName, variant.ExeName),
+                };
+
+                foreach (var candidate in candidates)
+                {
+                    if (File.Exists(candidate))
+                    {
+                        installations.Add(new VSCodeInstallation(variant.Name, candidate, variant.UriScheme, variant.CliName));
+                        break;
+                    }
+                }
+            }
+
+            // Fallback: resolve from code.cmd / code-insiders.cmd in PATH
+            try
+            {
+                var pathDirs = Environment.GetEnvironmentVariable("PATH")?.Split(Path.PathSeparator) ?? Array.Empty<string>();
+                foreach (var variant in variants)
+                {
+                    if (installations.Any(i => i.CliName == variant.CliName))
+                        continue;
+
+                    var cmdName = variant.CliName + ".cmd";
+                    foreach (var dir in pathDirs)
+                    {
+                        var codeCmdPath = Path.Combine(dir, cmdName);
+                        if (File.Exists(codeCmdPath))
+                        {
+                            // code.cmd is in <install>/bin/, Code.exe is in <install>/
+                            var codeExe = Path.Combine(Path.GetDirectoryName(dir) ?? dir, variant.ExeName);
+                            if (File.Exists(codeExe))
+                            {
+                                installations.Add(new VSCodeInstallation(variant.Name, codeExe, variant.UriScheme, variant.CliName));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            return installations;
+        }
 
         private ScrollViewer scrollViewer = null;
 
@@ -45,6 +279,23 @@ namespace StructuredLogViewer.Avalonia.Controls
         private MenuItem showFileInExplorerItem;
         private MenuItem preprocessItem;
         private MenuItem hideItem;
+        private MenuItem copyChildrenItem;
+        private MenuItem viewSubtreeTextItem;
+        private MenuItem showTimeItem;
+        private MenuItem openFileItem;
+        private MenuItem copyFilePathItem;
+        private MenuItem viewPropertyItem;
+        private MenuItem searchInSubtreeItem;
+        private MenuItem searchInNodeByNameItem;
+        private MenuItem searchThisNode;
+        private MenuItem excludeSubtreeFromSearchItem;
+        private MenuItem excludeNodeByNameFromSearch;
+        private MenuItem searchInclusiveWithinThisTimespan;
+        private MenuItem searchExclusiveWithinThisTimespan;
+        private MenuItem favoriteItem;
+        private MenuItem unfavoriteItem;
+        private MenuItem favoriteSharedItem;
+        private MenuItem unfavoriteSharedItem;
         private ContextMenu sharedTreeContextMenu;
         private ContextMenu filesTreeContextMenu;
         private TreeView treeView;
@@ -55,6 +306,7 @@ namespace StructuredLogViewer.Avalonia.Controls
         private TabItem propertiesAndItemsTab;
         private TabItem findInFilesTab;
         private SearchAndResultsControl filesTree;
+        private SearchAndResultsControl favoritesTree;
         private TabControl centralTabControl;
         private ListBox breadCrumb;
         private TabControl leftPaneTabControl;
@@ -149,12 +401,19 @@ namespace StructuredLogViewer.Avalonia.Controls
 
             // Search Log | Properties and Items | Find in Files
             sharedTreeContextMenu = new ContextMenu();
+            sharedTreeContextMenu.Opened += SharedTreeContextMenu_Opened;
+            favoriteSharedItem = new MenuItem { Header = "Add to Favorites" };
+            unfavoriteSharedItem = new MenuItem { Header = "Remove from Favorites" };
             var sharedCopyAllItem = new MenuItem() { Header = "Copy All" };
             var sharedCopySubtreeItem = new MenuItem() { Header = "Copy subtree" };
             var sharedCopyVisibleSubtreeItem = new MenuItem() { Header = "Copy visible subtree" };
+            favoriteSharedItem.Click += (s, a) => AddToFavorites();
+            unfavoriteSharedItem.Click += (s, a) => RemoveFromFavorites();
             sharedCopyAllItem.Click += (s, a) => CopyAll();
             sharedCopySubtreeItem.Click += (s, a) => CopySubtree();
             sharedCopyVisibleSubtreeItem.Click += (s, a) => CopySubtree(visibleOnly: true);
+            sharedTreeContextMenu.AddItem(favoriteSharedItem);
+            sharedTreeContextMenu.AddItem(unfavoriteSharedItem);
             sharedTreeContextMenu.AddItem(sharedCopyAllItem);
             sharedTreeContextMenu.AddItem(sharedCopySubtreeItem);
             sharedTreeContextMenu.AddItem(sharedCopyVisibleSubtreeItem);
@@ -175,9 +434,9 @@ namespace StructuredLogViewer.Avalonia.Controls
             filesTreeContextMenu.AddItem(filesCopyVisibleSubtreeItem);
 
             // Build Log
+            // Build Log
             var contextMenu = new ContextMenu();
-            // TODO
-            //contextMenu.Opened += ContextMenu_Opened;
+            contextMenu.Opened += ContextMenu_Opened;
             copyItem = new MenuItem() { Header = "Copy" };
             copySubtreeItem = new MenuItem() { Header = "Copy subtree" };
             copyVisibleSubtreeItem = new MenuItem() { Header = "Copy visible subtree" };
@@ -189,6 +448,36 @@ namespace StructuredLogViewer.Avalonia.Controls
             showFileInExplorerItem = new MenuItem() { Header = "Show in Explorer" };
             preprocessItem = new MenuItem() { Header = "Preprocess" };
             hideItem = new MenuItem() { Header = "Hide" };
+            copyChildrenItem = new MenuItem() { Header = "Copy children" };
+            viewSubtreeTextItem = new MenuItem() { Header = "View subtree text" };
+            showTimeItem = new MenuItem() { Header = "Show time and duration" };
+            openFileItem = new MenuItem() { Header = "Open File" };
+            copyFilePathItem = new MenuItem() { Header = "Copy file path" };
+            viewPropertyItem = new MenuItem() { Header = "View property" };
+            searchInSubtreeItem = new MenuItem() { Header = "Search in subtree" };
+            searchInNodeByNameItem = new MenuItem() { Header = "Search in this node." };
+            searchThisNode = new MenuItem() { Header = "Search this node" };
+            excludeSubtreeFromSearchItem = new MenuItem() { Header = "Exclude subtree from search" };
+            excludeNodeByNameFromSearch = new MenuItem() { Header = "Exclude node from search" };
+            searchInclusiveWithinThisTimespan = new MenuItem() { Header = "Search overlapping this duration" };
+            searchExclusiveWithinThisTimespan = new MenuItem() { Header = "Search within this duration" };
+            favoriteItem = new MenuItem() { Header = "Add to Favorites" };
+            unfavoriteItem = new MenuItem() { Header = "Remove from Favorites" };
+            copyChildrenItem.Click += (s, a) => CopyChildren();
+            viewSubtreeTextItem.Click += (s, a) => ViewSubtreeText();
+            showTimeItem.Click += (s, a) => ShowTimeAndDuration();
+            openFileItem.Click += (s, a) => OpenFile();
+            copyFilePathItem.Click += (s, a) => CopyFilePath();
+            viewPropertyItem.Click += (s, a) => ViewProperty();
+            searchInSubtreeItem.Click += (s, a) => SearchInSubtree();
+            searchInNodeByNameItem.Click += (s, a) => SearchInNodeByName();
+            searchThisNode.Click += (s, a) => SearchThisNode();
+            excludeSubtreeFromSearchItem.Click += (s, a) => ExcludeSubtreeFromSearch();
+            excludeNodeByNameFromSearch.Click += (s, a) => ExcludeNodeByNameFromSearch();
+            searchInclusiveWithinThisTimespan.Click += (s, a) => SearchInclusiveWithinThisTimespan();
+            searchExclusiveWithinThisTimespan.Click += (s, a) => SearchExclusiveWithinThisTimespan();
+            favoriteItem.Click += (s, a) => AddToFavorites();
+            unfavoriteItem.Click += (s, a) => RemoveFromFavorites();
             copyItem.Click += (s, a) => Copy();
             copySubtreeItem.Click += (s, a) => CopySubtree(treeView);
             copyVisibleSubtreeItem.Click += (s, a) => CopySubtree(treeView, visibleOnly: true);
@@ -200,17 +489,33 @@ namespace StructuredLogViewer.Avalonia.Controls
             showFileInExplorerItem.Click += (s, a) => ShowFileInExplorer();
             preprocessItem.Click += (s, a) => Preprocess(treeView.SelectedItem as IPreprocessable);
             hideItem.Click += (s, a) => Delete();
+            contextMenu.AddItem(favoriteItem);
+            contextMenu.AddItem(unfavoriteItem);
             contextMenu.AddItem(viewSourceItem);
+            contextMenu.AddItem(viewPropertyItem);
+            contextMenu.AddItem(openFileItem);
             contextMenu.AddItem(preprocessItem);
+            contextMenu.AddItem(searchThisNode);
+            contextMenu.AddItem(searchInSubtreeItem);
+            contextMenu.AddItem(searchInNodeByNameItem);
+            contextMenu.AddItem(excludeSubtreeFromSearchItem);
+            contextMenu.AddItem(excludeNodeByNameFromSearch);
+            contextMenu.AddItem(searchInclusiveWithinThisTimespan);
+            contextMenu.AddItem(searchExclusiveWithinThisTimespan);
+            contextMenu.AddItem(new Separator());
             contextMenu.AddItem(copyItem);
             contextMenu.AddItem(copySubtreeItem);
             contextMenu.AddItem(copyVisibleSubtreeItem);
-            contextMenu.AddItem(sortChildrenByNameItem);
-            contextMenu.AddItem(sortChildrenByDurationItem);
+            contextMenu.AddItem(copyFilePathItem);
+            contextMenu.AddItem(copyChildrenItem);
             contextMenu.AddItem(copyNameItem);
             contextMenu.AddItem(copyValueItem);
             contextMenu.AddItem(new Separator());
             contextMenu.AddItem(showFileInExplorerItem);
+            contextMenu.AddItem(viewSubtreeTextItem);
+            contextMenu.AddItem(showTimeItem);
+            contextMenu.AddItem(sortChildrenByNameItem);
+            contextMenu.AddItem(sortChildrenByDurationItem);
             contextMenu.AddItem(hideItem);
 
             Style GetTreeViewItemStyle()
@@ -272,6 +577,14 @@ Right-clicking a project node may show the 'Preprocess' option if the version of
 #endif
                 build.AddChild(new Note { Text = text });
             }
+
+            favoritesTree.TopPanel.IsVisible = false;
+            favoritesTree.ResultsList.Styles.Add(GetTreeViewItemStyle());
+            RegisterTreeViewHandlers(favoritesTree.ResultsList);
+            favoritesTree.ResultsList.SelectionChanged += ResultsList_SelectionChanged;
+            favoritesTree.ResultsList.ContextMenu = sharedTreeContextMenu;
+            favoritesTree.DisplayItems(new[] { new Note { Text = "Right-click any node and Favorite it to add it here" } });
+            favoritesTree.ResultsList.GotFocus += (s, a) => ActiveTreeView = favoritesTree.ResultsList;
 
             breadCrumb.SelectionChanged += BreadCrumb_SelectionChanged;
 
@@ -340,6 +653,7 @@ Right-clicking a project node may show the 'Preprocess' option if the version of
             this.RegisterControl(out projectContextBorder, nameof(projectContextBorder));
             this.RegisterControl(out propertiesAndItemsContext, nameof(propertiesAndItemsContext));
             this.RegisterControl(out filesTree, nameof(filesTree));
+            this.RegisterControl(out favoritesTree, nameof(favoritesTree));
             this.RegisterControl(out centralTabControl, nameof(centralTabControl));
             this.RegisterControl(out breadCrumb, nameof(breadCrumb));
             this.RegisterControl(out leftPaneTabControl, nameof(leftPaneTabControl));
@@ -499,17 +813,81 @@ Recent:
         private void ContextMenu_Opened(object sender, RoutedEventArgs e)
         {
             var node = treeView.SelectedItem as BaseNode;
-            var visibility = node is NameValueNode;
-            copyNameItem.IsVisible = visibility;
-            copyValueItem.IsVisible = visibility;
+            var nameValueVisibility = node is NameValueNode;
+            copyNameItem.IsVisible = nameValueVisibility;
+            copyValueItem.IsVisible = nameValueVisibility;
             viewSourceItem.IsVisible = CanView(node);
+            openFileItem.IsVisible = CanOpenFile(node);
+            copyFilePathItem.IsVisible = node is Import || (node is IHasSourceFile file && !string.IsNullOrEmpty(file.SourceFilePath));
             showFileInExplorerItem.IsVisible = CanShowInExplorer();
             var hasChildren = node is TreeNode t && t.HasChildren;
             copySubtreeItem.IsVisible = hasChildren;
             copyVisibleSubtreeItem.IsVisible = hasChildren;
+            viewSubtreeTextItem.IsVisible = hasChildren;
+            copyChildrenItem.IsVisible = hasChildren;
             sortChildrenByNameItem.IsVisible = hasChildren;
             sortChildrenByDurationItem.IsVisible = hasChildren;
             preprocessItem.IsVisible = node is IPreprocessable p && preprocessedFileManager.CanPreprocess(p);
+            hideItem.IsVisible = node is TreeNode;
+
+            if (node is SearchableItem searchItem)
+            {
+                searchThisNode.IsVisible = true;
+                searchThisNode.Header = $"Search {searchItem.SearchText}";
+            }
+            else
+            {
+                searchThisNode.IsVisible = false;
+            }
+
+            if (node is Property ||
+                (node?.Parent is { } parent &&
+                (parent.Title == Strings.PropertyReassignmentFolder ||
+                parent?.Parent?.Title == Strings.PropertyReassignmentFolder ||
+                parent.Title == Strings.PropertyAssignmentFolder ||
+                parent?.Parent?.Title == Strings.PropertyAssignmentFolder)))
+            {
+                viewPropertyItem.IsVisible = true;
+            }
+            else
+            {
+                viewPropertyItem.IsVisible = false;
+            }
+
+            bool isFavorite = IsFavorite(node);
+            favoriteItem.IsVisible = !isFavorite;
+            unfavoriteItem.IsVisible = isFavorite;
+
+            if (node is TimedNode timedNode)
+            {
+                showTimeItem.IsVisible = true;
+                searchInSubtreeItem.IsVisible = hasChildren;
+                excludeSubtreeFromSearchItem.IsVisible = hasChildren;
+                excludeNodeByNameFromSearch.IsVisible = hasChildren;
+                searchInclusiveWithinThisTimespan.IsVisible = true;
+                searchExclusiveWithinThisTimespan.IsVisible = true;
+                searchInNodeByNameItem.IsVisible = hasChildren;
+
+                if (excludeNodeByNameFromSearch.IsVisible)
+                {
+                    excludeNodeByNameFromSearch.Header = $"Exclude '{timedNode.Name}' from search";
+                }
+
+                if (searchInNodeByNameItem.IsVisible)
+                {
+                    searchInNodeByNameItem.Header = $"Search in '{timedNode.Name}'";
+                }
+            }
+            else
+            {
+                showTimeItem.IsVisible = false;
+                searchInSubtreeItem.IsVisible = false;
+                excludeSubtreeFromSearchItem.IsVisible = false;
+                excludeNodeByNameFromSearch.IsVisible = false;
+                searchInclusiveWithinThisTimespan.IsVisible = false;
+                searchExclusiveWithinThisTimespan.IsVisible = false;
+                searchInNodeByNameItem.IsVisible = false;
+            }
         }
 
         private object FindInFiles(string searchText, int maxResults, CancellationToken cancellationToken)
@@ -1066,8 +1444,13 @@ Recent:
             }
         }
 
-        public void SelectSearchTab()
+        public void SelectSearchTab(string newText = null)
         {
+            if (newText != null)
+            {
+                searchLogControl.SearchText = newText;
+            }
+
             leftPaneTabControl.SelectedItem = searchLogTab;
         }
 
@@ -1103,6 +1486,156 @@ Recent:
                 var text = Microsoft.Build.Logging.StructuredLogger.StringWriter.GetString(treeNode, visibleOnly);
                 CopyToClipboard(text);
             }
+        }
+
+        public void ViewSubtreeText()
+        {
+            if (treeView.SelectedItem is BaseNode treeNode)
+            {
+                var text = Microsoft.Build.Logging.StructuredLogger.StringWriter.GetString(treeNode);
+                DisplayText(text, treeNode.ToString());
+            }
+        }
+
+        public void ShowTimeAndDuration()
+        {
+            if (treeView.SelectedItem is TimedNode timedNode)
+            {
+                var text = timedNode.GetTimeAndDurationText(fullPrecision: true);
+                DisplayText(text, timedNode.ToString());
+            }
+        }
+
+        public void CopyChildren()
+        {
+            if (treeView.SelectedItem is TreeNode node && node.HasChildren)
+            {
+                var children = node.Children.Select(c => c.GetFullText());
+                var text = string.Join(Environment.NewLine, children);
+                CopyToClipboard(text);
+            }
+        }
+
+        private readonly HashSet<BaseNode> favorites = new HashSet<BaseNode>();
+
+        public void AddToFavorites()
+        {
+            var node = ActiveTreeView?.SelectedItem as BaseNode;
+            if (node != null)
+            {
+                if (node is ProxyNode proxy)
+                {
+                    node = proxy.Original ?? node;
+                }
+
+                if (favorites.Add(node))
+                {
+                    RefreshFavorites();
+                }
+            }
+        }
+
+        public void RemoveFromFavorites()
+        {
+            var node = ActiveTreeView?.SelectedItem as BaseNode;
+            if (node != null)
+            {
+                if (node is ProxyNode proxy)
+                {
+                    node = proxy.Original ?? node;
+                }
+
+                if (favorites.Remove(node))
+                {
+                    RefreshFavorites();
+                }
+            }
+        }
+
+        public bool IsFavorite(BaseNode node)
+        {
+            if (node is ProxyNode proxy)
+            {
+                node = proxy.Original ?? node;
+            }
+
+            return favorites.Contains(node);
+        }
+
+        public void RefreshFavorites()
+        {
+            var list = favorites.OrderBy(f =>
+            {
+                if (f is TimedNode timed)
+                {
+                    return timed.Index;
+                }
+
+                return 0;
+            }).Select(f =>
+            {
+                var searchResult = new SearchResult(f);
+                return searchResult;
+            }).ToArray();
+
+            var tree = ResultTree.BuildResultTree(
+                list,
+                addDuration: false,
+                addWhenNoResults: () => new Note { Text = "Right-click any node and Favorite it to add it here" });
+
+            SortByIndex(tree);
+
+            favoritesTree.DisplayItems(tree.Children);
+        }
+
+        private static int CompareByIndex(BaseNode l, BaseNode r)
+        {
+            if (l == r)
+            {
+                return 0;
+            }
+
+            if (l is null || r is null)
+            {
+                return -1;
+            }
+
+            if (l is TimedNode timedLeft && r is TimedNode timedRight)
+            {
+                return timedLeft.Index - timedRight.Index;
+            }
+
+            return 0;
+        }
+
+        private void SortByIndex(TreeNode node)
+        {
+            node.SortChildren(CompareByIndex);
+            SortByIndex(node.Children);
+        }
+
+        private void SortByIndex(IList<BaseNode> list)
+        {
+            foreach (var child in list)
+            {
+                if (child is TreeNode childNode)
+                {
+                    SortByIndex(childNode);
+                }
+            }
+        }
+
+        private void SharedTreeContextMenu_Opened(object sender, RoutedEventArgs e)
+        {
+            var node = ActiveTreeView.SelectedItem as BaseNode;
+            if (node == null)
+            {
+                return;
+            }
+
+            bool isFavorite = IsFavorite(node);
+            favoriteSharedItem.IsVisible = !isFavorite;
+            unfavoriteSharedItem.IsVisible = isFavorite;
         }
 
         public void SortChildrenByName()
@@ -1216,6 +1749,219 @@ Recent:
             return FileExplorerHelper.GetFilePathFromNode(treeView.SelectedItem as BaseNode) is not null;
         }
 
+        public void OpenFile()
+        {
+            if (treeView.SelectedItem is Import import)
+            {
+                DisplayFile(import.ImportedProjectFilePath, evaluation: import.GetNearestParent<ProjectEvaluation>());
+            }
+        }
+
+        public void CopyFilePath()
+        {
+            string toCopy = null;
+            if (treeView.SelectedItem is Import import)
+            {
+                toCopy = import.ImportedProjectFilePath;
+            }
+            else if (treeView.SelectedItem is IHasSourceFile file)
+            {
+                toCopy = file.SourceFilePath;
+            }
+
+            if (toCopy != null)
+            {
+                CopyToClipboard(toCopy);
+            }
+        }
+
+        private bool CanOpenFile(BaseNode node)
+        {
+            return node is Import i && sourceFileResolver.HasFile(i.ImportedProjectFilePath);
+        }
+
+        public void ViewProperty()
+        {
+            var selectedItem = treeView.SelectedItem;
+            if (selectedItem is Property property)
+            {
+                SearchForProperty(property.Name);
+            }
+            else if (selectedItem is PropertyAssignmentMessage assignment)
+            {
+                SearchForProperty(assignment.Parent.Title);
+            }
+            else if (selectedItem is Folder reassignmentFolder
+                && reassignmentFolder.Parent is TimedNode parent
+                && (parent.Name == Strings.PropertyReassignmentFolder || parent.Name == Strings.PropertyAssignmentFolder))
+            {
+                SearchForProperty(reassignmentFolder.Name);
+            }
+        }
+
+        public void SearchInSubtree()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                searchLogControl.SearchText += $" under(${treeNode.Index})";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchInNodeByName()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                if (treeNode is Project)
+                {
+                    searchLogControl.SearchText += $" project({treeNode.Name})";
+                }
+                else
+                {
+                    searchLogControl.SearchText += $" under(${treeNode.TypeName} {treeNode.Name})";
+                }
+
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchThisNode()
+        {
+            if (treeView.SelectedItem is SearchableItem searchNode)
+            {
+                searchLogControl.SearchText = searchNode.SearchText;
+                SelectSearchTab();
+            }
+        }
+
+        public void ExcludeSubtreeFromSearch()
+        {
+            if (treeView.SelectedItem is TimedNode treeNode)
+            {
+                searchLogControl.SearchText += $" notunder(${treeNode.Index})";
+                SelectSearchTab();
+            }
+        }
+
+        public void ExcludeNodeByNameFromSearch()
+        {
+            if (treeView.SelectedItem is NamedNode treeNode)
+            {
+                searchLogControl.SearchText += $" notunder(${treeNode.TypeName} {treeNode.Name})";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchInclusiveWithinThisTimespan()
+        {
+            if (treeView.SelectedItem is TimedNode timedNode)
+            {
+                DateTime starTime = timedNode.StartTime;
+                DateTime endTime = timedNode.EndTime;
+                searchLogControl.SearchText += $" start<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\" end>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" ";
+                SelectSearchTab();
+            }
+        }
+
+        public void SearchExclusiveWithinThisTimespan()
+        {
+            if (treeView.SelectedItem is TimedNode timedNode)
+            {
+                DateTime starTime = timedNode.StartTime;
+                DateTime endTime = timedNode.EndTime;
+                searchLogControl.SearchText += $" start>\"{TextUtilities.Display(starTime, displayDate: true, fullPrecision: true)}\" end<\"{TextUtilities.Display(endTime, displayDate: true, fullPrecision: true)}\"";
+                SelectSearchTab();
+            }
+        }
+
+        private bool SearchForProject(string name)
+        {
+            var text = $"$projectreference project({name})";
+            searchLogControl.SearchText = text;
+            return true;
+        }
+
+        private bool SearchForTarget(string name)
+        {
+            string text = searchLogControl.SearchText;
+            var matcher = new NodeQueryMatcher(text);
+            string project = "";
+            if (matcher.ProjectMatchers.Count == 1)
+            {
+                project = $" project({matcher.ProjectMatchers[0].Query})";
+            }
+
+            text = $"$target \"{name}\"{project}";
+            searchLogControl.SearchText = text;
+            return true;
+        }
+
+        private bool SearchForProperty(string name)
+        {
+            SelectPropertiesAndItemsTab($"$property \"{name}\"");
+            return true;
+        }
+
+        private bool SearchForFullPath(string filePath)
+        {
+            var text = searchLogControl.SearchText;
+            var matcher = new NodeQueryMatcher(text);
+            if (matcher.Terms.Count == 1 &&
+                matcher.Terms[0].Word is string substring &&
+                filePath.IndexOf(substring, StringComparison.OrdinalIgnoreCase) != -1)
+            {
+                text = text.Replace(substring, filePath);
+                searchLogControl.SearchText = text;
+                return true;
+            }
+            else if (matcher.Terms.Count == 0 && matcher.ProjectMatchers.Count > 0)
+            {
+                text = $"{text} {filePath}";
+                searchLogControl.SearchText = text;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool DisplayEmbeddedFile(Item item)
+        {
+            string path = item.Text;
+            var candidates = sourceFileResolver.ArchiveFile.FindFileNames(path).ToArray();
+            if (candidates.Length == 1)
+            {
+                return DisplayFile(candidates[0]);
+            }
+
+            return false;
+        }
+
+        public void SelectPropertiesAndItemsTab(string newText = null)
+        {
+            if (newText != null)
+            {
+                propertiesAndItemsControl.SearchText = newText;
+            }
+
+            leftPaneTabControl.SelectedItem = propertiesAndItemsTab;
+        }
+
+        public void SelectFindInFilesTab(string newText = null)
+        {
+            if (!findInFilesTab.IsVisible)
+            {
+                return;
+            }
+
+            if (newText != null)
+            {
+                findInFilesControl.SearchText = newText;
+            }
+
+            leftPaneTabControl.SelectedItem = findInFilesTab;
+            findInFilesControl.searchTextBox.Focus();
+        }
+
         private void MoveSelectionOut(BaseNode node)
         {
             var parent = node.Parent;
@@ -1302,6 +2048,9 @@ Recent:
                         }
 
                         break;
+
+                    case Target target when target.Parent is Folder:
+                        return SearchForTarget(target.Name);
                     case Target target:
                         return DisplayTarget(target.SourceFilePath, target.Name);
                     case Task task:
@@ -1310,6 +2059,21 @@ Recent:
                         return DisplayAddRemoveItem(addItem.Parent, addItem.LineNumber ?? 0);
                     case RemoveItem removeItem:
                         return DisplayAddRemoveItem(removeItem.Parent, removeItem.LineNumber ?? 0);
+                    case Item embedItem when embedItem.Parent is AddItem parentAddItem && parentAddItem.Name == "EmbedInBinlog":
+                        return DisplayEmbeddedFile(embedItem);
+                    case Item pathItem when
+                        pathItem.Parent == null &&
+                        searchLogControl.SearchText.Contains("$copy") &&
+                        searchLogControl.ResultsList.ItemsSource is IEnumerable<BaseNode> copyResults &&
+                        copyResults.Contains(pathItem):
+                        return SearchForFullPath(pathItem.Text);
+                    case Project projectRef when
+                        searchLogControl.SearchText.Contains("$projectreference"):
+                        return SearchForProject(Path.GetFileName(projectRef.ProjectFile));
+                    case ProxyNode proxy when
+                        searchLogControl.SearchText.Contains("$projectreference") &&
+                        proxy.Original is Project originalProject:
+                        return SearchForProject(Path.GetFileName(originalProject.ProjectFile));
                     case IHasSourceFile hasSourceFile when hasSourceFile.SourceFilePath != null:
                         int line = 0;
                         var hasLine = hasSourceFile as IHasLineNumber;
@@ -1328,6 +2092,11 @@ Recent:
                         return DisplayFile(hasSourceFile.SourceFilePath, line, evaluation: evaluation);
                     case SourceFileLine sourceFileLine when sourceFileLine.Parent is SourceFile sourceFile && sourceFile.SourceFilePath != null:
                         return DisplayFile(sourceFile.SourceFilePath, sourceFileLine.LineNumber);
+                    case Property property:
+                        return SearchForProperty(property.Name);
+                    case Folder reassignmentFolder when reassignmentFolder.Parent is TimedNode reassignmentParent &&
+                        (reassignmentParent.Name == Strings.PropertyReassignmentFolder || reassignmentParent.Name == Strings.PropertyAssignmentFolder):
+                        return SearchForProperty(reassignmentFolder.Name);
                     case NameValueNode nameValueNode when nameValueNode.IsValueShortened:
                         return DisplayText(nameValueNode.Value, nameValueNode.Name);
                     case NamedNode namedNode when namedNode.IsNameShortened:
@@ -1521,6 +2290,123 @@ Recent:
         private void TreeViewItem_Selected(object sender, RoutedEventArgs e)
         {
             SelectedTreeViewItem = e.Source as TreeViewItem;
+        }
+
+        public void DisplayStats()
+        {
+            if (!File.Exists(LogFilePath))
+            {
+                return;
+            }
+
+            var statsRoot = Build.FindChild<Folder>(static f => f.Name.StartsWith(Strings.Statistics));
+            if (statsRoot != null)
+            {
+                return;
+            }
+
+            var recordStats = BinlogStats.Calculate(this.LogFilePath);
+            var records = recordStats.CategorizedRecords;
+
+            statsRoot = DisplayRecordStats(records, Build);
+
+            var treeStats = Build.Statistics;
+            DisplayTreeStats(statsRoot, treeStats, recordStats);
+
+            statsRoot.AddChild(new Property { Name = "BinlogFileFormatVersion", Value = Build.FileFormatVersion.ToString() });
+            statsRoot.AddChild(new Property { Name = "FileSize", Value = recordStats.FileSize.ToString("N0") });
+            statsRoot.AddChild(new Property { Name = "UncompressedStreamSize", Value = recordStats.UncompressedStreamSize.ToString("N0") });
+            statsRoot.AddChild(new Property { Name = "RecordCount", Value = recordStats.RecordCount.ToString("N0") });
+
+            // This is needed as a workaround for a weird WPF bug; replacing the Children collection
+            // acts as a Reset. See https://github.com/KirillOsenkov/MSBuildStructuredLog/issues/487
+            Build.MakeChildrenObservable();
+        }
+
+        private void DisplayTreeStats(Folder statsRoot, BuildStatistics treeStats, BinlogStats recordStats)
+        {
+            var buildMessageNode = statsRoot.FindChild<Folder>(static n => n.Name.StartsWith("BuildMessage", StringComparison.Ordinal));
+            var taskInputsNode = buildMessageNode.FindChild<Folder>(static n => n.Name.StartsWith("Task Input", StringComparison.Ordinal));
+            var taskOutputsNode = buildMessageNode.FindChild<Folder>(static n => n.Name.StartsWith("Task Output", StringComparison.Ordinal));
+
+            AddTopTasks(treeStats.TaskParameterMessagesByTask, taskInputsNode);
+            AddTopTasks(treeStats.OutputItemMessagesByTask, taskOutputsNode);
+
+            if (recordStats.StringTotalSize > 0)
+            {
+                var strings = new Item
+                {
+                    Text = BinlogStats.GetString("Strings", recordStats.StringTotalSize, recordStats.StringCount, recordStats.StringLargest)
+                };
+                var allStringText = recordStats.AllStrings.Count > 0
+                    ? string.Join("\n", recordStats.AllStrings)
+                    : "Strings are not tracked for large binlogs";
+                var allStrings = new Message { Text = allStringText };
+
+                statsRoot.AddChild(strings);
+                strings.AddChild(allStrings);
+            }
+
+            if (recordStats.NameValueListTotalSize > 0)
+            {
+                statsRoot.AddChild(new Message
+                {
+                    Text = BinlogStats.GetString(
+                        "NameValueLists",
+                        recordStats.NameValueListTotalSize,
+                        recordStats.NameValueListCount,
+                        recordStats.NameValueListLargest)
+                });
+            }
+
+            if (recordStats.BlobTotalSize > 0)
+            {
+                statsRoot.AddChild(new Message
+                {
+                    Text = BinlogStats.GetString("Blobs", recordStats.BlobTotalSize, recordStats.BlobCount, recordStats.BlobLargest)
+                });
+            }
+        }
+
+        private static void AddTopTasks(Dictionary<string, List<string>> messagesByTask, Folder node)
+        {
+            var topTaskParameters = messagesByTask
+                .Select(kvp => (taskName: kvp.Key, count: kvp.Value.Count, totalSize: kvp.Value.Sum(s => s.Length * 2), largest: kvp.Value.Max(s => s.Length) * 2))
+                .OrderByDescending(kvp => kvp.totalSize)
+                .Take(20);
+            foreach (var task in topTaskParameters)
+            {
+                var name = BinlogStats.GetString(task.taskName, task.totalSize, task.count, task.largest);
+                node.AddChild(new Folder { Name = name });
+            }
+        }
+
+        private Folder DisplayRecordStats(BinlogStats.RecordsByType stats, TreeNode parent, string titlePrefix = "")
+        {
+            var node = parent.GetOrCreateNodeWithName<Folder>(titlePrefix + stats.ToString());
+
+            if (stats.CategorizedRecords != null)
+            {
+                foreach (var records in stats.CategorizedRecords)
+                {
+                    DisplayRecordStats(records, node);
+                }
+            }
+
+            var top = stats.Records.Take(300).ToArray();
+            foreach (var item in top)
+            {
+                if (item.Args is EnvironmentVariableReadEventArgs env)
+                {
+                    node.AddChild(new Property { Name = env.EnvironmentVariableName, Value = env.Message });
+                }
+                else if (item.Args is BuildMessageEventArgs buildMessage)
+                {
+                    node.AddChild(new Message { Text = buildMessage.Message });
+                }
+            }
+
+            return node;
         }
 
         public override string ToString()
