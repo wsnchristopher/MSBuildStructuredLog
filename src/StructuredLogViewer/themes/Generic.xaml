@@ -60,6 +60,7 @@
   <SolidColorBrush x:Key="AddItemStroke" Color="Teal" />
   <SolidColorBrush x:Key="MetadataStroke" Color="Teal" />
   <SolidColorBrush x:Key="MessageStroke" Color="LightGray" />
+  <SolidColorBrush x:Key="MSBuildServerStroke" Color="CornflowerBlue" />
   <SolidColorBrush x:Key="ImportStroke" Color="Sienna" />
   <SolidColorBrush x:Key="NoImportStroke" Color="Red" />
   <SolidColorBrush x:Key="NoImportFill" Color="BlanchedAlmond" />
@@ -118,6 +119,11 @@
   <LinearGradientBrush x:Key="MessageBrush" StartPoint="0,0" EndPoint="1,1">
     <GradientStop Color="White" Offset="0" />
     <GradientStop Color="LightGray" Offset="1" />
+  </LinearGradientBrush>
+
+  <LinearGradientBrush x:Key="MSBuildServerBrush" StartPoint="0,0" EndPoint="1,1">
+    <GradientStop Color="AliceBlue" Offset="0" />
+    <GradientStop Color="CornflowerBlue" Offset="1" />
   </LinearGradientBrush>
 
   <LinearGradientBrush x:Key="ErrorBrush" StartPoint="0,0" EndPoint="1,1">
@@ -639,6 +645,19 @@
                             ItemsSource="{Binding Children}">
     <StackPanel Orientation="Horizontal">
       <Rectangle x:Name="icon" Style="{StaticResource NodeIcon}" Stroke="{DynamicResource MessageStroke}" Fill="{DynamicResource MessageBrush}" />
+      <TextBlock x:Name="messageText" Text="{Binding ShortenedText}" />
+    </StackPanel>
+    <DataTemplate.Triggers>
+      <DataTrigger Binding="{Binding IsLowRelevance}" Value="True">
+        <Setter TargetName="messageText" Property="Opacity" Value="0.25" />
+      </DataTrigger>
+    </DataTemplate.Triggers>
+  </HierarchicalDataTemplate>
+
+  <HierarchicalDataTemplate DataType="{x:Type l:MSBuildServerNode}"
+                            ItemsSource="{Binding Children}">
+    <StackPanel Orientation="Horizontal">
+      <Rectangle x:Name="icon" Style="{StaticResource NodeIcon}" Stroke="{DynamicResource MSBuildServerStroke}" Fill="{DynamicResource MSBuildServerBrush}" />
       <TextBlock x:Name="messageText" Text="{Binding ShortenedText}" />
     </StackPanel>
     <DataTemplate.Triggers>

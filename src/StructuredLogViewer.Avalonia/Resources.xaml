@@ -14,6 +14,7 @@
     <SolidColorBrush x:Key="ItemStroke" Color="MediumAquamarine" />
     <SolidColorBrush x:Key="MetadataStroke" Color="MediumAquamarine" />
     <SolidColorBrush x:Key="MessageStroke" Color="LightGray" />
+    <SolidColorBrush x:Key="MSBuildServerStroke" Color="CornflowerBlue" />
     <SolidColorBrush x:Key="ImportStroke" Color="Sienna" />
     <SolidColorBrush x:Key="NoImportStroke" Color="Red" />
     <SolidColorBrush x:Key="ErrorStroke" Color="Red" />
@@ -62,6 +63,11 @@
     <LinearGradientBrush x:Key="MessageBrush" StartPoint="0%,0%" EndPoint="100%,100%">
         <GradientStop Color="White" Offset="0" />
         <GradientStop Color="LightGray" Offset="1" />
+    </LinearGradientBrush>
+
+    <LinearGradientBrush x:Key="MSBuildServerBrush" StartPoint="0%,0%" EndPoint="100%,100%">
+        <GradientStop Color="AliceBlue" Offset="0" />
+        <GradientStop Color="CornflowerBlue" Offset="1" />
     </LinearGradientBrush>
 
     <LinearGradientBrush x:Key="ErrorBrush" StartPoint="0%,0%" EndPoint="100%,100%">

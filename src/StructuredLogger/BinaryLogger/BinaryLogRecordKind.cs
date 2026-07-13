@@ -37,5 +37,7 @@
         BuildCheckAcquisition,
         BuildSubmissionStarted,
         BuildCanceled,
+        LoggersRegistered,
+        MSBuildServerLifecycle,
     }
 }

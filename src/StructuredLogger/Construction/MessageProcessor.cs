@@ -26,6 +26,32 @@ namespace Microsoft.Build.Logging.StructuredLogger
 
         private string Intern(string text) => stringTable.Intern(text);
 
+        /// <summary>Name of the folder under Build that collects MSBuild Server lifecycle events.</summary>
+        private const string MSBuildServerFolderName = "MSBuild Server";
+
+        /// <summary>
+        /// Adds an MSBuild Server lifecycle event as a dedicated node under a "MSBuild Server" folder.
+        /// </summary>
+        private void ProcessMSBuildServerLifecycle(MSBuildServerLifecycleEventArgs args)
+        {
+            var node = new MSBuildServerNode
+            {
+                Text = Intern(args.Message),
+                Kind = Intern(args.Kind.ToString()),
+                ShortLived = args.ShortLived,
+                Reason = string.IsNullOrEmpty(args.Reason) ? null : Intern(args.Reason),
+                ReasonCode = string.IsNullOrEmpty(args.ReasonCode) ? null : Intern(args.ReasonCode),
+            };
+
+            if (args.ProcessId != 0)
+            {
+                node.ProcessId = args.ProcessId;
+            }
+
+            var folder = construction.Build.GetOrCreateNodeWithName<Folder>(MSBuildServerFolderName);
+            folder.AddChild(node);
+        }
+
         public void Process(BuildMessageEventArgs args)
         {
             if (args == null)
@@ -36,6 +62,14 @@ namespace Microsoft.Build.Logging.StructuredLogger
             if (fileFormatVersion == 0)
             {
                 fileFormatVersion = construction.Build.FileFormatVersion;
+            }
+
+            // MSBuild Server lifecycle events (spawn/reuse/not-used) are a dedicated, structured event type.
+            // Surface them under a "MSBuild Server" folder with their own node type (and icon).
+            if (args is MSBuildServerLifecycleEventArgs serverLifecycle)
+            {
+                ProcessMSBuildServerLifecycle(serverLifecycle);
+                return;
             }
 
             if (args is TaskParameterEventArgs taskParameter)
