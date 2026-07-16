@@ -38,6 +38,14 @@ namespace Microsoft.Build.Logging.StructuredLogger
         public event Action<BinaryLogReaderErrorEventArgs>? RecoverableReadError;
 
         /// <summary>
+        /// Set to true after <see cref="Replay(Stream, Progress)"/> if the log ended without an
+        /// EndOfFile marker, i.e. it was truncated because the build that produced it was interrupted
+        /// (killed, timed out, or crashed) before it could be finalized. All complete records were
+        /// still replayed.
+        /// </summary>
+        public bool HasEncounteredTruncation { get; private set; }
+
+        /// <summary>
         /// Read the provided binary log file and raise corresponding events for each BuildEventArgs
         /// </summary>
         /// <param name="sourceFilePath">The full file path of the binary log file</param>
@@ -180,6 +188,8 @@ namespace Microsoft.Build.Logging.StructuredLogger
                     }
                 }
             }
+
+            HasEncounteredTruncation = reader.ReachedEndOfStreamPrematurely;
 
             if (progress != null)
             {

@@ -177,27 +177,39 @@ namespace Microsoft.Build.Logging.StructuredLogger
             ////                           $"Raw data reading is not supported for file format version {_fileFormatVersion} (needs >=18).");
             ////}
 
-            if (_lastSubStream?.IsAtEnd == false)
+            try
             {
-                _lastSubStream.ReadToEnd();
+                if (_lastSubStream?.IsAtEnd == false)
+                {
+                    _lastSubStream.ReadToEnd();
+                }
+
+                BinaryLogRecordKind recordKind =
+                    PreprocessRecordsTillNextEvent(decodeTextualRecords ? IsTextualDataRecord : (_ => false));
+
+                if (recordKind == BinaryLogRecordKind.EndOfFile)
+                {
+                    return new(recordKind, Stream.Null);
+                }
+
+                int serializedEventLength = ReadInt32();
+                Stream stream = _binaryReader.BaseStream.Slice(serializedEventLength);
+
+                _lastSubStream = stream as SubStream;
+
+                _recordNumber += 1;
+
+                return new(recordKind, stream);
             }
-
-            BinaryLogRecordKind recordKind =
-                PreprocessRecordsTillNextEvent(decodeTextualRecords ? IsTextualDataRecord : (_ => false));
-
-            if (recordKind == BinaryLogRecordKind.EndOfFile)
+            catch (EndOfStreamException)
             {
-                return new(recordKind, Stream.Null);
+                // Truncated/interrupted log: the stream ends before a record is complete and no
+                // EndOfFile marker was written. Report a synthetic end-of-file so raw consumers
+                // (ChunkBinlog, BinlogTool dumprecords) stop cleanly instead of crashing, and record
+                // that the log was truncated.
+                ReachedEndOfStreamPrematurely = true;
+                return new(BinaryLogRecordKind.EndOfFile, Stream.Null);
             }
-
-            int serializedEventLength = ReadInt32();
-            Stream stream = _binaryReader.BaseStream.Slice(serializedEventLength);
-
-            _lastSubStream = stream as SubStream;
-
-            _recordNumber += 1;
-
-            return new(recordKind, stream);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -213,6 +225,15 @@ namespace Microsoft.Build.Logging.StructuredLogger
         internal BinaryLogRecordKind LastRecordKind;
 
         /// <summary>
+        /// Set to true when the reader reached the physical end of the stream without encountering
+        /// the <see cref="BinaryLogRecordKind.EndOfFile"/> marker. This means the log was truncated
+        /// because the build that produced it was interrupted (killed, timed out, or crashed) before
+        /// <c>BinaryLogger.Shutdown()</c> could finalize it. Every complete record read before that
+        /// point is still valid and has been returned.
+        /// </summary>
+        public bool ReachedEndOfStreamPrematurely { get; private set; }
+
+        /// <summary>
         /// Reads the next log record from the <see cref="BinaryReader"/>.
         /// </summary>
         /// <returns>
@@ -225,19 +246,32 @@ namespace Microsoft.Build.Logging.StructuredLogger
             BuildEventArgs? result = null;
             while (result == null)
             {
-                BinaryLogRecordKind recordKind = PreprocessRecordsTillNextEvent(IsAuxiliaryRecord);
-                LastRecordKind = recordKind;
-
-                if (recordKind == BinaryLogRecordKind.EndOfFile)
-                {
-                    return null;
-                }
-
+                BinaryLogRecordKind recordKind;
                 int serializedEventLength = 0;
-                if (_fileFormatVersion >= BinaryLogger.ForwardCompatibilityMinimalVersion)
+                try
                 {
-                    serializedEventLength = ReadInt32(); // record length
-                    _readStream.BytesCountAllowedToRead = serializedEventLength;
+                    recordKind = PreprocessRecordsTillNextEvent(IsAuxiliaryRecord);
+                    LastRecordKind = recordKind;
+
+                    if (recordKind == BinaryLogRecordKind.EndOfFile)
+                    {
+                        return null;
+                    }
+
+                    if (_fileFormatVersion >= BinaryLogger.ForwardCompatibilityMinimalVersion)
+                    {
+                        serializedEventLength = ReadInt32(); // record length
+                        _readStream.BytesCountAllowedToRead = serializedEventLength;
+                    }
+                }
+                catch (EndOfStreamException)
+                {
+                    // Reached the physical end of a truncated log while positioning at / sizing the
+                    // next record, with no EndOfFile marker present. The producing build was killed
+                    // (timeout, taskkill /F, crash) before BinaryLogger.Shutdown() ran. Stop cleanly
+                    // so all complete records read so far are recovered.
+                    ReachedEndOfStreamPrematurely = true;
+                    return null;
                 }
 
                 bool hasError = false;
@@ -264,6 +298,13 @@ namespace Microsoft.Build.Logging.StructuredLogger
                             : string.Empty);
 
                     HandleError(ErrorFactory, _skipUnknownEvents, ReaderErrorType.UnknownFormatOfEventData, recordKind, e);
+                }
+                catch (EndOfStreamException)
+                {
+                    // Ran out of physical bytes in the middle of a record (the log was truncated by an
+                    // interrupted build). Recover everything up to here and stop without throwing.
+                    ReachedEndOfStreamPrematurely = true;
+                    return null;
                 }
 
                 if (result == null && !hasError)
