@@ -438,5 +438,244 @@ namespace Microsoft.Build.UnitTests
             // There is nothing else in the stream
             memoryStream.Position.Should().Be(length);
         }
+
+        // ---------------------------------------------------------------------------------------
+        // Truncated / interrupted binlog recovery.
+        //
+        // A build that is hard-killed (test-run timeout killer, taskkill /F, CI job cancel, OOM,
+        // crash) never runs BinaryLogger.Shutdown(), so its .binlog is missing the trailing
+        // EndOfFile marker (and the gzip footer). The reader must recover every complete record
+        // written before the cut, stop cleanly instead of throwing, and flag the log as truncated
+        // so the viewer/CLI can tell the user the log was "recovered" and is "partial".
+        // ---------------------------------------------------------------------------------------
+
+        [Fact]
+        public void InterruptedLog_ReadStopsCleanlyAndFlagsTruncation()
+        {
+            // No EndOfFile marker => the producing build was interrupted before it finalized the log.
+            byte[] records = WriteEventRecords(count: 5, withEndOfFileMarker: false);
+
+            var (recovered, truncated, thrown) = ReadAllEvents(records);
+
+            thrown.Should().BeNull("a truncated log must stop cleanly, not throw");
+            recovered.Should().Be(5, "every complete record written before the cut is still recoverable");
+            truncated.Should().BeTrue("a stream that ends without an EndOfFile marker is a truncated log");
+        }
+
+        [Fact]
+        public void FinalizedLog_ReadDoesNotFlagTruncation()
+        {
+            // A cleanly shut-down build terminates the record stream with an EndOfFile marker.
+            byte[] records = WriteEventRecords(count: 5, withEndOfFileMarker: true);
+
+            var (recovered, truncated, thrown) = ReadAllEvents(records);
+
+            thrown.Should().BeNull();
+            recovered.Should().Be(5);
+            truncated.Should().BeFalse("an EndOfFile marker means the log was finalized - not truncated");
+        }
+
+        [Theory]
+        [InlineData(0.90)]
+        [InlineData(0.60)]
+        [InlineData(0.35)]
+        [InlineData(0.15)]
+        public void TruncatedLog_ReadRecoversPrefixWithoutThrowing(double keptFraction)
+        {
+            // Cut the stream at an arbitrary offset to hit both record-boundary and mid-record
+            // truncation. Whatever the cut, reading must never throw and must flag truncation.
+            byte[] full = WriteEventRecords(count: 8, withEndOfFileMarker: true);
+            int keep = Math.Max(1, (int)(full.Length * keptFraction));
+            byte[] truncatedRecords = full.Take(keep).ToArray();
+
+            var (recovered, truncated, thrown) = ReadAllEvents(truncatedRecords);
+
+            thrown.Should().BeNull("mid-stream truncation must be handled without crashing");
+            truncated.Should().BeTrue("a cut stream loses its EndOfFile marker");
+            recovered.Should().BeInRange(0, 8);
+        }
+
+        [Fact]
+        public void ReadRaw_TruncatedLog_ReturnsSyntheticEndOfFileWithoutThrowing()
+        {
+            // The raw record path backs BinlogTool `dumprecords` / ChunkBinlog, which used to crash
+            // (0xE0434352) on a truncated log. It must now terminate at a synthetic EndOfFile.
+            byte[] full = WriteEventRecords(count: 6, withEndOfFileMarker: false);
+            byte[] truncatedRecords = full.Take(full.Length / 2).ToArray();
+
+            var memoryStream = new MemoryStream(truncatedRecords);
+            var binaryReader = new BinaryReader(memoryStream);
+            using var reader = new Logging.StructuredLogger.BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion);
+
+            Exception thrown = null;
+            bool reachedEndOfFile = false;
+            try
+            {
+                for (int guard = 0; guard < 10_000; guard++)
+                {
+                    var raw = reader.ReadRaw();
+                    if (raw.RecordKind == BinaryLogRecordKind.EndOfFile)
+                    {
+                        reachedEndOfFile = true;
+                        break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+
+            thrown.Should().BeNull("the raw reader must stop cleanly on a truncated log instead of crashing");
+            reachedEndOfFile.Should().BeTrue("raw reading terminates at a synthetic EndOfFile");
+            reader.ReachedEndOfStreamPrematurely.Should().BeTrue();
+        }
+
+        [Fact]
+        public void Replay_InterruptedLog_SetsHasEncounteredTruncation()
+        {
+            // End-to-end through the real seam: gzip + file header + BinLogReader.Replay.
+            using var stream = CreateBinlogStream(withEndOfFileMarker: false);
+
+            var reader = new BinLogReader();
+            reader.Replay(stream);
+
+            reader.HasEncounteredTruncation.Should().BeTrue();
+        }
+
+        [Fact]
+        public void Replay_FinalizedLog_DoesNotSetTruncation()
+        {
+            using var stream = CreateBinlogStream(withEndOfFileMarker: true);
+
+            var reader = new BinLogReader();
+            reader.Replay(stream);
+
+            reader.HasEncounteredTruncation.Should().BeFalse();
+        }
+
+        [Fact]
+        public void ReadBuild_InterruptedLog_SurfacesRecoveredPartialError()
+        {
+            // The user-facing behavior: a truncated binlog opens as a build carrying exactly one
+            // clear "recovered a partial binlog" error (message text mirrors BinaryLog.cs).
+            using var stream = CreateBinlogStream(withEndOfFileMarker: false);
+
+            var build = BinaryLog.ReadBuild(stream);
+
+            build.Should().NotBeNull();
+            var truncationErrors = build.FindChildrenRecursive<Microsoft.Build.Logging.StructuredLogger.Error>(
+                e => e.Text != null && e.Text.StartsWith("Recovered a partial binlog"));
+            truncationErrors.Should().ContainSingle("a truncated binlog is surfaced as a single 'recovered a partial binlog' error");
+        }
+
+        [Fact]
+        public void ReadBuild_FinalizedLog_HasNoTruncationError()
+        {
+            using var stream = CreateBinlogStream(withEndOfFileMarker: true);
+
+            var build = BinaryLog.ReadBuild(stream);
+
+            build.Should().NotBeNull();
+            var truncationErrors = build.FindChildrenRecursive<Microsoft.Build.Logging.StructuredLogger.Error>(
+                e => e.Text != null && e.Text.StartsWith("Recovered a partial binlog"));
+            truncationErrors.Should().BeEmpty("a finalized binlog must not report truncation");
+        }
+
+        // Writes `count` well-formed build event records as a raw record stream (no file header, no
+        // gzip), mirroring the ForwardCompatibleRead_* tests. Optionally terminates with an EndOfFile
+        // marker to represent a cleanly finalized log.
+        private static byte[] WriteEventRecords(int count, bool withEndOfFileMarker)
+        {
+            var memoryStream = new MemoryStream();
+            var binaryWriter = new BinaryWriter(memoryStream);
+            var writer = new BuildEventArgsWriter(binaryWriter);
+
+            for (int i = 0; i < count; i++)
+            {
+                writer.Write(CreateEvent(i));
+            }
+
+            binaryWriter.Flush();
+
+            if (withEndOfFileMarker)
+            {
+                // The EndOfFile terminator is written straight to the underlying stream (as
+                // BinaryLogger.Shutdown does with stream.WriteByte), not through the record-framing
+                // writer, which buffers into a discarded per-record stream.
+                memoryStream.WriteByte((byte)BinaryLogRecordKind.EndOfFile);
+            }
+
+            return memoryStream.ToArray();
+        }
+
+        // Builds a complete gzip-compressed binlog stream (file header + records) the way
+        // BinaryLogger writes one, optionally without the trailing EndOfFile marker to simulate a
+        // hard-killed build. The gzip itself is valid; only the record stream inside is unterminated.
+        private static Stream CreateBinlogStream(bool withEndOfFileMarker)
+        {
+            var decompressed = new MemoryStream();
+            var binaryWriter = new BinaryWriter(decompressed);
+
+            // File header: fileFormatVersion + minimumReaderVersion, both raw Int32 (v18+).
+            binaryWriter.Write(BinaryLogger.FileFormatVersion);
+            binaryWriter.Write(BinaryLogger.FileFormatVersion);
+
+            var writer = new BuildEventArgsWriter(binaryWriter);
+            writer.Write(new BuildStartedEventArgs("Build started", helpKeyword: null));
+            for (int i = 0; i < 4; i++)
+            {
+                writer.Write(CreateEvent(i));
+            }
+
+            binaryWriter.Flush();
+
+            if (withEndOfFileMarker)
+            {
+                // Terminator written directly to the stream, matching BinaryLogger.Shutdown.
+                decompressed.WriteByte((byte)BinaryLogRecordKind.EndOfFile);
+            }
+
+            decompressed.Position = 0;
+
+            var compressed = new MemoryStream();
+            using (var gzip = new System.IO.Compression.GZipStream(compressed, System.IO.Compression.CompressionLevel.Optimal, leaveOpen: true))
+            {
+                decompressed.CopyTo(gzip);
+            }
+
+            compressed.Position = 0;
+            return compressed;
+        }
+
+        private static BuildEventArgs CreateEvent(int i) => (i % 3) switch
+        {
+            0 => new BuildMessageEventArgs($"message {i} with a reasonably long payload so records span several bytes", "Help", "Sender", MessageImportance.Normal),
+            1 => new BuildErrorEventArgs("Subcategory", $"CODE{i}", "File.cs", i + 1, i + 2, i + 3, i + 4, $"error message {i}", "Help", "Sender"),
+            _ => new BuildWarningEventArgs("Subcategory", $"WARN{i}", "File.cs", i + 1, i + 2, i + 3, i + 4, $"warning message {i}", "Help", "Sender"),
+        };
+
+        private static (int recovered, bool truncated, Exception thrown) ReadAllEvents(byte[] recordBytes)
+        {
+            var memoryStream = new MemoryStream(recordBytes);
+            var binaryReader = new BinaryReader(memoryStream);
+            using var reader = new Logging.StructuredLogger.BuildEventArgsReader(binaryReader, BinaryLogger.FileFormatVersion);
+
+            int recovered = 0;
+            Exception thrown = null;
+            try
+            {
+                while (reader.Read() != null)
+                {
+                    recovered++;
+                }
+            }
+            catch (Exception ex)
+            {
+                thrown = ex;
+            }
+
+            return (recovered, reader.ReachedEndOfStreamPrematurely, thrown);
+        }
     }
 }

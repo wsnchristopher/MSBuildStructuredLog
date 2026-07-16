@@ -179,6 +179,16 @@ namespace Microsoft.Build.Logging.StructuredLogger
                 build.AddChild(node);
             }
 
+            if (eventSource.HasEncounteredTruncation && build != null)
+            {
+                build.AddChild(new Error()
+                {
+                    Text = "Recovered a partial binlog. The build was stopped before the log was " +
+                        "finalized, so it holds only the events collected up to that point — " +
+                        "everything shown is valid."
+                });
+            }
+
             return build;
         }
     }
